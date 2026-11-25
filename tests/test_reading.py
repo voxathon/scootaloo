@@ -306,12 +306,14 @@ def test_layout_maximize_resize_persist_and_help(deep):
             await pilot.press("question_mark")
             await pilot.pause(0.2)
             assert not app.screen.query("HelpPanel")
-        with core.read_state(mox) as st:
-            assert st.get("layout.name") == "two" and st.get("layout.list_share") == str(share + 5)
+        from scootaloo import settings
+
+        prefs = settings.preferences(mox.stores)
+        assert prefs.get("layout.name") == "two" and prefs.get("layout.list_share") == share + 5
 
         # narrow windows stack the three-pane layout
-        with core.read_state(mox) as st:
-            st.set("layout.name", "three")
+        prefs.set("layout.name", "three")
+        prefs.save()
         app = ScootalooApp(user="moxxie", password="hunter222")
         async with app.run_test(size=(80, 40)) as pilot:
             await settle(pilot, app)

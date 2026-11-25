@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import json
 import os
 import shutil
 import subprocess
@@ -209,6 +210,39 @@ async def cmd_user_passwd(args):
     with Users() as u:
         n = u.change_password(name, old, new)
     out.print(f"password changed for [bold]{name}[/]; re-encrypted {n} identity key{'s' if n != 1 else ''}")
+
+
+def _show_or_set(st, args, what: str) -> None:
+    from scootaloo.settings import SettingsError
+
+    if st.warning:
+        err.print(f"[yellow]{st.warning}[/]")
+    if args.key is None:
+        for k, v in st.items().items():
+            out.print(f"{k} = [bold]{json.dumps(v)}[/]")
+        out.print(f"[dim]{st.path}[/]")
+        return
+    try:
+        if args.value is None:
+            out.print(json.dumps(st.get(args.key)))
+            return
+        st.set(args.key, args.value)
+    except SettingsError as e:
+        raise core.ScootalooError(str(e)) from None
+    st.save()
+    out.print(f"{what}: {args.key} = [bold]{json.dumps(st.get(args.key))}[/]")
+
+
+async def cmd_config(args):
+    from scootaloo import settings
+
+    _show_or_set(settings.config(), args, "config")
+
+
+async def cmd_prefs(args):
+    from scootaloo import settings
+
+    _show_or_set(settings.preferences(account(args).stores), args, "preferences")
 
 
 async def cmd_login(args):
@@ -594,6 +628,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("login", help="make NAME the default user for later commands")
     p.add_argument("name")
     p.set_defaults(fn=cmd_login)
+
+    p = sub.add_parser("config", help="app-wide settings (config.json): list, read, or set one")
+    p.add_argument("key", nargs="?", help="e.g. login.list_users")
+    p.add_argument("value", nargs="?", help="new value, e.g. false")
+    p.set_defaults(fn=cmd_config)
+
+    p = sub.add_parser("prefs", help="your own preferences (preferences.json): list, read, or set one")
+    p.add_argument("key", nargs="?", help="e.g. layout.name")
+    p.add_argument("value", nargs="?", help="new value, e.g. stacked")
+    p.set_defaults(fn=cmd_prefs)
 
     p = sub.add_parser("connect", help="join a relay and pin its key")
     p.add_argument("url", nargs="?", default=core.DEFAULT_URL)

@@ -3,6 +3,7 @@
 scootaloo is an application, so it has local users. Each user has a password
 (no exceptions) and a directory of their own:
 
+    <home>/config.json                  app-wide settings (see settings.py)
     <home>/users.db                     names + bcrypt hashes
     <home>/current                      last user to log in (a name, never a secret)
     <home>/users/<name>/identities.db   Bonnet identities, keys wrapped with the user's password
@@ -10,6 +11,7 @@ scootaloo is an application, so it has local users. Each user has a password
     <home>/users/<name>/trust.db        origin keys this user has accepted
     <home>/users/<name>/state.db        what this user has read, trusted link domains, layout
     <home>/users/<name>/cache.db        article bodies, keyed (and checked) by their hash
+    <home>/users/<name>/preferences.json  this user's preferences (layout, pane sizes)
 
 Pins and joined origins are per user on purpose: accepting a key is a trust
 decision, and one person's decision shouldn't commit another.
@@ -64,6 +66,7 @@ class Stores:
     label: str
     state_path: str = ""
     cache_path: str = ""
+    preferences_path: str = ""
 
     @classmethod
     def for_user(cls, name: str) -> "Stores":
@@ -76,6 +79,7 @@ class Stores:
             label=name,
             state_path=os.path.join(d, "state.db"),
             cache_path=os.path.join(d, "cache.db"),
+            preferences_path=os.path.join(d, "preferences.json"),
         )
 
     @classmethod
@@ -88,7 +92,8 @@ class Stores:
         # Read state is scootaloo's own, so it stays in scootaloo's home even here.
         state = os.path.join(home(), "gateway-store-state.db")
         cache = os.path.join(home(), "gateway-store-cache.db")
-        return cls(*paths, label="gateway store", state_path=state, cache_path=cache)
+        prefs = os.path.join(home(), "gateway-store-preferences.json")
+        return cls(*paths, label="gateway store", state_path=state, cache_path=cache, preferences_path=prefs)
 
     def identities(self) -> IdentityStore:
         return IdentityStore(self.identities_path)

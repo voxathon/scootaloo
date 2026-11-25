@@ -39,7 +39,9 @@ scootaloo user passwd [NAME]      # change a password (re-encrypts that user's k
 scootaloo user remove NAME        # deletes the user and their keys
 ```
 
-Each command logs in as `--user`, else `$SCOOTALOO_USER`, else whoever logged in last. The password comes from `--password`, else `$SCOOTALOO_PASSWORD`, else you're asked. In the TUI you log in once; `ctrl+l` switches user.
+Each command logs in as `--user`, else `$SCOOTALOO_USER`, else whoever logged in last. The password comes from `--password`, else `$SCOOTALOO_PASSWORD`, else you're asked.
+
+In the TUI you log in once (`ctrl+l` switches user). With one user, it only asks for that user's password. With several, it shows a menu of names, and picking one leads to its password (`esc` goes back). Set `scootaloo config login.list_users false` to get a blank name and password form instead. `ctrl+n` creates a user from any of these.
 
 ## Reading other origins
 
@@ -75,7 +77,9 @@ The TUI shows unread counts on boards and an **Inbox** at the top of the board t
 
 | command | what it does |
 |---|---|
-| `scootaloo user add/list/remove`, `login` | manage local users (see above) |
+| `scootaloo user add/list/remove/passwd`, `login` | manage local users (see above) |
+| `scootaloo config [KEY [VALUE]]` | app-wide settings |
+| `scootaloo prefs [KEY [VALUE]]` | your preferences |
 | `scootaloo connect [url]` | join a relay and pin its key (`-y` accepts a *first-contact* key without asking; a *changed* key always asks) |
 | `scootaloo relay ORIGIN` | switch the active relay |
 | `scootaloo register NAME` | create an identity on the active relay |
@@ -153,17 +157,39 @@ Layout and sizes are remembered per user. A window narrower than 100 columns sta
 
 **Speed.** Article bodies are cached on disk, keyed by the hash their author signed, and re-checked against it every time they're read, so a cached body is never stale and never trusted blindly. Threads are cached in memory until their origin publishes something new. Skimming and reopening threads mostly doesn't touch the network.
 
+## Settings
+
+Two JSON files, both safe to edit by hand:
+
+- **`config.json`**: app-wide, for everyone on this machine. `scootaloo config` lists it, `scootaloo config KEY VALUE` sets a value.
+
+  | key | default | |
+  |---|---|---|
+  | `login.list_users` | `true` | show a menu of users at login; `false` shows a blank name and password form |
+
+- **`preferences.json`**: one per user. `scootaloo prefs` lists it, `scootaloo prefs KEY VALUE` sets a value. The TUI keeps it up to date as you change the layout.
+
+  | key | default | |
+  |---|---|---|
+  | `layout.name` | `three` | `three` panes, `two` (list and thread), or `stacked` |
+  | `layout.boards_width` | `32` | board tree width, 16–80 columns |
+  | `layout.list_share` | `50` | how much of the width (height, stacked) the thread list gets, 15–85 percent |
+
+Values are checked against each setting's type and range, unknown keys in a file are left alone, and a file that isn't valid JSON is set aside as `*.broken` (never deleted) while the defaults are used.
+
 ## Where state lives
 
 In `$SCOOTALOO_HOME`, else your OS's per-user data folder (`%LOCALAPPDATA%\scootaloo` on Windows):
 
 ```
+config.json                   app-wide settings
 users.db                      user names + bcrypt password hashes
 current                       the last user to log in (a name, not a secret)
 users/<name>/identities.db    Bonnet identities (keys encrypted with the user's password)
 users/<name>/origins.db       joined relays
 users/<name>/trust.db         accepted origin keys
-users/<name>/state.db         what you've read, trusted link hosts, layout
+users/<name>/state.db         what you've read, trusted link hosts
+users/<name>/preferences.json your preferences (layout)
 users/<name>/cache.db         article bodies (checked against their hashes)
 ```
 

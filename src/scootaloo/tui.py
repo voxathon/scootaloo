@@ -25,7 +25,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from scootaloo import core, links
+from scootaloo import core, links, settings
 from scootaloo.accounts import Account, AccountError, Stores, Users, default_user
 
 
@@ -240,15 +240,30 @@ class Post(Vertical, can_focus=True):
 # ---------------------------------------------------------------------------
 
 
-class Login(Screen[Account]):
-    """Pick a user and give their password, or make a new user. Every user has a password."""
+NEW_USER = "\x00new"
 
-    BINDINGS = [Binding("ctrl+n", "toggle_new", "New user"), Binding("ctrl+q", "app.quit", "Quit")]
+
+class Login(Screen[Account]):
+    """Getting in. Every user has a password.
+
+    What it shows depends on who's here (and config.json's login.list_users):
+    no users -> create one; one user -> just their password; several -> a menu
+    of names (or, with listing off, a blank name + password form). Picking a
+    name leads to a password screen for it; esc goes back to the menu.
+    """
+
+    BINDINGS = [
+        Binding("ctrl+n", "new_user", "New user"),
+        Binding("escape", "back", "Back", show=False),
+        Binding("ctrl+q", "app.quit", "Quit"),
+    ]
 
     def __init__(self, user: str | None = None):
         super().__init__()
         self.preset = user
-        self.creating = False
+        self.mode = "menu"  # menu | password | blank | create
+        self.chosen: str | None = None
+        self.start_mode = "menu"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="login"):
@@ -260,78 +275,119 @@ class Login(Screen[Account]):
             yield Input(placeholder="password again", password=True, id="login-pw2")
             with Horizontal(id="compose-buttons"):
                 yield Button("Log in", variant="primary", id="login-go")
-                yield Button("New user (ctrl+n)", id="login-new")
+                yield Button("Back (esc)", id="login-back")
             yield Label("", id="login-error")
+            yield Label("", id="login-hint")
         yield Footer()
 
     def on_mount(self) -> None:
         with Users() as u:
-            names = u.names()
-        ol = self.query_one("#login-users", OptionList)
-        for n in names:
-            ol.add_option(Option(n, id=n))
-        self.creating = not names
-        guess = self.preset or default_user()
-        if guess in names:
-            ol.highlighted = names.index(guess)
-            self.query_one("#login-name", Input).value = guess
-        self._render_mode()
+            self.names = u.names()
+        listing = settings.config().get("login.list_users")
+        if not self.names:
+            self.start_mode = "create"
+        elif self.preset in self.names:
+            self.start_mode, self.chosen = "password", self.preset
+        elif len(self.names) == 1:
+            self.start_mode, self.chosen = "password", self.names[0]
+        elif listing:
+            self.start_mode = "menu"
+        else:
+            self.start_mode = "blank"
+        self._go(self.start_mode)
 
-    def _render_mode(self) -> None:
-        ol = self.query_one("#login-users", OptionList)
-        has_users = ol.option_count > 0
-        self.query_one("#login-mode", Label).update(
-            "New user. The password also encrypts their Bonnet keys." if self.creating else "Log in"
-        )
-        ol.display = has_users and not self.creating
-        self.query_one("#login-pw2", Input).display = self.creating
-        self.query_one("#login-go", Button).label = "Create" if self.creating else "Log in"
-        self.query_one("#login-new", Button).label = "Back to log in" if self.creating else "New user (ctrl+n)"
-        self.query_one("#login-new", Button).display = has_users or not self.creating
-        name = self.query_one("#login-name", Input)
-        if self.creating:
+    # -- modes ---------------------------------------------------------------
+
+    @property
+    def single(self) -> bool:
+        return len(self.names) == 1
+
+    def _go(self, mode: str) -> None:
+        self.mode = mode
+        q = self.query_one
+        ol, name, pw, pw2 = q("#login-users", OptionList), q("#login-name", Input), q("#login-pw", Input), q("#login-pw2", Input)
+        go, back = q("#login-go", Button), q("#login-back", Button)
+        q("#login-error", Label).update("")
+        pw.value = pw2.value = ""
+        ol.display = mode == "menu"
+        name.display = mode in ("blank", "create")
+        pw.display = mode in ("password", "blank", "create")
+        pw2.display = mode == "create"
+        go.display = mode != "menu"
+        back.display = mode == "create" and bool(self.names) or (mode == "password" and self.start_mode == "menu")
+        hint = ""
+        if mode == "menu":
+            title = "Who's reading?"
+            ol.clear_options()
+            for n in self.names:
+                ol.add_option(Option(n, id=n))
+            ol.add_option(Option(Text("New user…", style="italic"), id=NEW_USER))
+            guess = default_user()
+            ol.highlighted = self.names.index(guess) if guess in self.names else 0
+            ol.focus()
+            hint = "enter: choose"
+        elif mode == "password":
+            title = f"Password for {self.chosen}"
+            go.label = "Log in"
+            pw.focus()
+            hint = "ctrl+n: new user" if self.single else "esc: other users · ctrl+n: new user"
+        elif mode == "blank":
+            title = "Log in"
+            go.label = "Log in"
             name.value = ""
             name.focus()
-        elif name.value:
-            self.query_one("#login-pw", Input).focus()
+            hint = "ctrl+n: new user"
         else:
+            title = "New user. The password also encrypts their Bonnet keys."
+            go.label = "Create"
+            name.value = ""
             name.focus()
+            hint = "esc: back" if self.names else ""
+        q("#login-mode", Label).update(Text(title, style="bold" if mode == "password" else ""))
+        q("#login-hint", Label).update(Text(hint, style="dim"))
 
-    @on(OptionList.OptionHighlighted, "#login-users")
-    def picked(self, ev: OptionList.OptionHighlighted) -> None:
-        self.query_one("#login-name", Input).value = ev.option.id
+    def action_new_user(self) -> None:
+        self._go(self.start_mode if self.mode == "create" and self.names else "create")
+
+    def action_back(self) -> None:
+        if self.mode == "create" and self.names:
+            self._go(self.start_mode)
+        elif self.mode == "password" and self.start_mode == "menu":
+            self._go("menu")
+
+    @on(Button.Pressed, "#login-back")
+    def back_pressed(self) -> None:
+        self.action_back()
 
     @on(OptionList.OptionSelected, "#login-users")
-    def chosen(self, ev: OptionList.OptionSelected) -> None:
-        self.query_one("#login-name", Input).value = ev.option.id
-        self.query_one("#login-pw", Input).focus()
-
-    @on(Button.Pressed, "#login-new")
-    def action_toggle_new(self) -> None:
-        self.creating = not self.creating
-        self._render_mode()
+    def chosen_user(self, ev: OptionList.OptionSelected) -> None:
+        if ev.option.id == NEW_USER:
+            self._go("create")
+        else:
+            self.chosen = ev.option.id
+            self._go("password")
 
     @on(Input.Submitted)
     def submitted(self, ev: Input.Submitted) -> None:
         if ev.input.id == "login-name":
             self.query_one("#login-pw", Input).focus()
-        elif ev.input.id == "login-pw" and self.creating:
+        elif ev.input.id == "login-pw" and self.mode == "create":
             self.query_one("#login-pw2", Input).focus()
         else:
             self.go()
 
     @on(Button.Pressed, "#login-go")
     def go(self) -> None:
-        name = self.query_one("#login-name", Input).value.strip()
         pw = self.query_one("#login-pw", Input).value
+        name = self.chosen if self.mode == "password" else self.query_one("#login-name", Input).value.strip()
         error = self.query_one("#login-error", Label)
         try:
             with Users() as u:
-                if self.creating:
+                if self.mode == "create":
                     if pw != self.query_one("#login-pw2", Input).value:
                         raise AccountError("passwords didn't match")
                     u.add(name, pw)
-                acct = u.login(name, pw)
+                acct = u.login(name or "", pw)
         except AccountError as e:
             error.update(Text(str(e), style="red"))
             self.query_one("#login-pw", Input).value = ""
@@ -566,6 +622,8 @@ class ScootalooApp(App):
     #login-users { height: auto; max-height: 8; margin-bottom: 1; }
     #login Input { margin-bottom: 1; }
     #login-error { margin-top: 1; }
+    #login-hint { margin-top: 1; }
+    #login-mode { width: 100%; height: auto; margin-bottom: 1; }
     """
     BINDINGS = [
         Binding("question_mark", "help", "Keys"),
@@ -1393,20 +1451,38 @@ class ScootalooApp(App):
             view.styles.width = f"{100 - self.list_share}fr"
 
     def _load_layout(self) -> None:
-        with core.read_state(self.acct) as st:
-            name = st.get("layout.name", "three")
-            self.layout_name = name if name in self.LAYOUTS else "three"
-            self.boards_width = int(st.get("layout.boards_width", "32"))
-            self.list_share = int(st.get("layout.list_share", "50"))
+        prefs = settings.preferences(self.acct.stores)
+        if not prefs.exists:
+            self._migrate_layout(prefs)
+        if prefs.warning:
+            self.notify(prefs.warning, severity="warning", timeout=10)
+        self.layout_name = prefs.get("layout.name")
+        self.boards_width = prefs.get("layout.boards_width")
+        self.list_share = prefs.get("layout.list_share")
         self._apply_layout()
+
+    def _migrate_layout(self, prefs) -> None:
+        """0.5.x kept the layout in state.db; carry it into preferences.json once."""
+        with core.read_state(self.acct) as st:
+            old = {k: st.get(f"layout.{k}") for k in ("name", "boards_width", "list_share")}
+        if not any(v is not None for v in old.values()):
+            return
+        for k, v in old.items():
+            if v is not None:
+                try:
+                    prefs.set(f"layout.{k}", v)
+                except settings.SettingsError:
+                    pass
+        prefs.save()
 
     def _save_layout(self) -> None:
         if not self.acct:
             return
-        with core.read_state(self.acct) as st:
-            st.set("layout.name", self.layout_name)
-            st.set("layout.boards_width", str(self.boards_width))
-            st.set("layout.list_share", str(self.list_share))
+        prefs = settings.preferences(self.acct.stores)
+        prefs.set("layout.name", self.layout_name)
+        prefs.set("layout.boards_width", self.boards_width)
+        prefs.set("layout.list_share", self.list_share)
+        prefs.save()
 
     def on_resize(self, event) -> None:
         if self.acct:

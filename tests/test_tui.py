@@ -60,8 +60,9 @@ def test_login_screen_then_board(world):
         app = ScootalooApp()
         async with app.run_test(size=(160, 45)) as pilot:
             await pilot.pause(0.3)
-            assert isinstance(app.screen, Login)
-            app.screen.query_one("#login-name", Input).value = "moxxie"
+            assert isinstance(app.screen, Login) and app.screen.mode == "menu"  # two users: a menu
+            app.screen.chosen = "moxxie"
+            app.screen._go("password")
             app.screen.query_one("#login-pw", Input).value = "wrong-password"
             app.screen.go()
             await pilot.pause(0.2)
