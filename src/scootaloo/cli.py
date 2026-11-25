@@ -316,19 +316,24 @@ async def cmd_ls(args):
     acct = account(args)
     ref = await board_ref(args, acct)
     rows = await core.articles(acct, ref, args.n)
+    idx = core.Index()
+    await idx.refresh(acct, [ref])
+    per_thread = core.unread_threads(idx, ref, core.unread(acct, idx, [ref])[ref])
     if not rows:
         out.print(f"[dim]{ref.label} is empty[/]")
         return
     if not ref.is_home:
         out.print(f"[dim]{ref.name} on {ref.origin}, via {ref.via}[/]")
     t = Table(box=None, pad_edge=False)
+    t.add_column("", style="yellow")
     t.add_column("#", justify="right", style="cyan")
-    t.add_column("subject", style="bold", overflow="fold")
+    t.add_column("subject", overflow="fold")
     t.add_column("author")
     t.add_column("when", style="dim")
     for a in rows:
-        subj = ("📌 " if a.pin_state == "pinned" else "") + (a.subject or "")
-        t.add_row(str(a.article_num), subj, core.author_label(a), when(a.created_at))
+        n = per_thread.get(a.article_id, 0)
+        subj = Text(("📌 " if a.pin_state == "pinned" else "") + (a.subject or ""), style="bold" if n else "")
+        t.add_row(f"●{n}" if n else "", str(a.article_num), subj, core.author_label(a), when(a.created_at))
     out.print(t)
 
 
@@ -341,6 +346,7 @@ async def cmd_read(args):
     th = await core.thread(acct, ref, args.num)
     for item in th.items:
         print_item(item, args.raw)
+    core.mark_read(acct, ref, [i.view.article_num for i in th.items])
     if th.truncated:
         out.print("[yellow]thread truncated at 200 articles[/]")
 
@@ -366,6 +372,158 @@ async def cmd_reply(args):
     body = read_body(args, header)
     r = await core.reply(acct, ref, args.num, body, args.subject, args.content_type, args.as_)
     out.print(f"replied as [bold]#{r.article_num}[/] in {ref.label}")
+
+
+async def cmd_unread(args):
+    acct = account(args)
+    refs = await core.all_boards(acct, args.relay)
+    idx = core.Index()
+    await idx.refresh(acct, refs)
+    counts = {r: n for r, n in core.unread(acct, idx, refs).items() if n}
+    if not counts:
+        out.print("[dim]nothing unread[/]")
+        return
+    t = Table(box=None, pad_edge=False)
+    t.add_column("unread", justify="right", style="yellow")
+    t.add_column("board", style="bold cyan")
+    t.add_column("threads", style="dim")
+    for ref, nums in sorted(counts.items(), key=lambda kv: (-len(kv[1]), kv[0].label)):
+        threads = core.unread_threads(idx, ref, nums)
+        t.add_row(str(len(nums)), ref.label, f"{len(threads)} thread{'s' if len(threads) != 1 else ''}")
+    out.print(t)
+
+
+async def cmd_inbox(args):
+    acct = account(args)
+    refs = await core.all_boards(acct, args.relay)
+    idx = core.Index()
+    await idx.refresh(acct, refs)
+    items = [i for i in core.inbox(acct, idx) if args.all or i.unread]
+    if not items:
+        out.print("[dim]no " + ("" if args.all else "unread ") + "replies to you[/]")
+        return
+    t = Table(box=None, pad_edge=False)
+    t.add_column("", style="yellow")
+    t.add_column("board", style="cyan")
+    t.add_column("#", justify="right", style="cyan")
+    t.add_column("reply")
+    t.add_column("to your")
+    t.add_column("when", style="dim")
+    for i in items:
+        t.add_row("●" if i.unread else "", i.ref.label, str(i.row.article_num),
+                  f"{core.author_label(i.row)}: {i.row.subject}", f"#{i.parent.article_num}", when(i.row.created_at))
+    out.print(t)
+    out.print("[dim]`scootaloo read BOARD NUM` opens one (and marks it read)[/]")
+
+
+async def cmd_mark(args):
+    acct = account(args)
+    ref = await board_ref(args, acct)
+    idx = core.Index()
+    await idx.refresh(acct, [ref])
+    core.mark_board_read(acct, idx, ref)
+    out.print(f"marked everything on {ref.label} read")
+
+
+async def cmd_edit(args):
+    acct = account(args)
+    ref = await board_ref(args, acct)
+    core.writable(acct, ref, args.as_)
+    subject, old = await core.current_body(acct, ref, args.num)
+    if args.message is None and not args.file and sys.stdin.isatty():
+        body = _edit_text(old)
+    else:
+        body = read_body(args)
+    if body.strip() == old.strip() and not args.subject:
+        out.print("[dim]no changes[/]")
+        return
+    r = await core.edit(acct, ref, args.num, body, args.subject, args.as_)
+    out.print(f"edited #{args.num}; it's now [bold]#{r.article_num}[/] (the old version is kept as superseded)")
+
+
+def _edit_text(text: str) -> str:
+    with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False, encoding="utf-8") as tf:
+        tf.write(text)
+        path = tf.name
+    try:
+        subprocess.call(_editor() + [path])
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    finally:
+        os.unlink(path)
+
+
+async def cmd_delete(args):
+    acct = account(args)
+    ref = await board_ref(args, acct)
+    core.writable(acct, ref, args.as_)
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise core.ScootalooError("pass --yes to delete without a prompt")
+        if not Confirm.ask(f"delete #{args.num} on {ref.label}?", default=False, console=err):
+            return
+    await core.delete(acct, ref, args.num, args.reason or "", args.as_)
+    out.print(f"deleted #{args.num}. Bonnet keeps the signed record; the article no longer shows.")
+
+
+async def cmd_search(args):
+    acct = account(args)
+    if args.board:
+        refs = [await core.resolve_board(acct, args.board, args.from_, args.relay)]
+    else:
+        refs = [r for r in await core.all_boards(acct, args.relay) if not r.name.startswith("~") or args.bridges]
+    hits = await core.search(acct, refs, args.query, args.n)
+    if not hits:
+        out.print("[dim]no matches[/]")
+        return
+    t = Table(box=None, pad_edge=False)
+    t.add_column("board", style="cyan")
+    t.add_column("#", justify="right", style="cyan")
+    t.add_column("subject", style="bold", overflow="fold")
+    t.add_column("author")
+    t.add_column("when", style="dim")
+    for h in hits:
+        t.add_row(h.ref.label, str(h.article_num), h.subject, h.author, when(h.created_at))
+    out.print(t)
+
+
+async def cmd_verify(args):
+    acct = account(args)
+    ref = await board_ref(args, acct)
+    v = await core.verify(acct, ref, args.num)
+    print_verification(v)
+
+
+def verification_markup(v: core.Verification) -> str:
+    """Rich markup describing a verification, shared by the CLI and the TUI."""
+
+    def mark(state, good=("valid", "matches", "absent")):
+        if state in good:
+            return f"[green]✓ {state}[/]"
+        if state in ("unverifiable", "unavailable"):
+            return f"[yellow]? {state}[/]"
+        return f"[bold red]✗ {state}[/]"
+
+    lines = [f"[bold]#{v.article_num}[/] on {v.ref.label} · event {v.event_id[:16]}… · seq {v.origin_seq} on {v.ref.origin}", ""]
+    lines.append(f"  author signature   {mark(v.author_sig)}  [dim]key {v.author_key[:16]}…[/]")
+    hint = f"  [dim]accept {v.ref.origin}'s key (connect to it) to check this[/]" if v.origin_sig == "unverifiable" else ""
+    lines.append(f"  origin signature   {mark(v.origin_sig)}{hint}")
+    lines.append(f"  body               {mark(v.body)}")
+    lines.append("  relay's summary    " + ("[green]✓ matches the signed record[/]" if v.view_matches
+                                            else f"[bold red]✗ differs: {', '.join(v.mismatches)}[/]"))
+    lines.append("  path")
+    for h in v.hops:
+        ok = "[green]✓[/]" if h["signature_valid"] else "[bold red]✗ bad signature[/]"
+        what = "published it" if h["is_origin"] else f"got it from {h['received_from_hostname'] or h['received_from_pubkey'][:12]}"
+        link = "" if h["linked"] else " [yellow](not linked to the chain)[/]"
+        lines.append(f"    {ok} {h['relay_origin'] or h['relay_hostname']} {what} · {when(h['seen_at'])}{link}")
+    lines.append("")
+    lines.append("[bold green]verified[/]" if v.ok else "[bold yellow]not fully verified, see above[/]")
+    return "\n".join(lines)
+
+
+def print_verification(v: core.Verification) -> None:
+    out.print(verification_markup(v))
 
 
 async def cmd_tail(args):
@@ -495,6 +653,43 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-i", "--interval", type=int, default=15)
     p.add_argument("-b", "--back", type=int, default=5, help="also show this many recent posts")
     p.set_defaults(fn=cmd_tail)
+
+    sub.add_parser("unread", help="boards with unread posts").set_defaults(fn=cmd_unread)
+
+    p = sub.add_parser("inbox", help="replies to your posts")
+    p.add_argument("-a", "--all", action="store_true", help="include ones you've read")
+    p.set_defaults(fn=cmd_inbox)
+
+    p = sub.add_parser("mark", help="mark everything on a board read")
+    _board_args(p)
+    p.set_defaults(fn=cmd_mark)
+
+    p = sub.add_parser("edit", help="edit your own post (opens $EDITOR with the current text)")
+    _board_args(p)
+    p.add_argument("num", type=int)
+    p.add_argument("-s", "--subject", help="new subject")
+    _body_args(p)
+    p.set_defaults(fn=cmd_edit)
+
+    p = sub.add_parser("delete", help="delete your own post")
+    _board_args(p)
+    p.add_argument("num", type=int)
+    p.add_argument("--reason", help="optional reason, stored with the cancel")
+    p.add_argument("-y", "--yes", action="store_true", help="don't ask")
+    p.set_defaults(fn=cmd_delete)
+
+    p = sub.add_parser("search", help="search subjects (and bodies, where the server indexes them)")
+    p.add_argument("query")
+    p.add_argument("board", nargs="?", help="one board (name or name@origin); default: all")
+    p.add_argument("--from", dest="from_", metavar="ORIGIN")
+    p.add_argument("-n", type=int, default=50)
+    p.add_argument("--bridges", action="store_true", help="include ~ bridge boards")
+    p.set_defaults(fn=cmd_search)
+
+    p = sub.add_parser("verify", help="check the signatures behind an article")
+    _board_args(p)
+    p.add_argument("num", type=int)
+    p.set_defaults(fn=cmd_verify)
 
     sub.add_parser("tui", help="the full-screen client (same as plain `scootaloo`)").set_defaults(fn=cmd_tui)
     return ap

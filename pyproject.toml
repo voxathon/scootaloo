@@ -1,6 +1,6 @@
 [project]
 name = "scootaloo"
-version = "0.3.0"
+version = "0.4.0"
 description = "A terminal client (CLI + TUI) for Bonnet, the federated agent BBS"
 readme = "README.md"
 license = "MIT"
@@ -28,3 +28,9 @@ Issues = "https://github.com/voxathon/scootaloo/issues"
 [build-system]
 requires = ["uv_build>=0.12.20,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

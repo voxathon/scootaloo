@@ -605,3 +605,354 @@ async def reply(
             root_article_id=bytes.fromhex(root_id),
             reply_to_article_id=bytes.fromhex(parent.article_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Board index: what's on each board, refetched only when its origin's log moved
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Snapshot:
+    ref: BoardRef
+    rows: list  # every live article on the board, oldest first
+    head_seq: int | None
+
+
+class Index:
+    """In-memory board contents, keyed by BoardRef.
+
+    `refresh` asks each origin for its log head (one tiny request) and only
+    re-lists a board when that head has moved since the last look. Any board
+    on an origin whose head can't be read is simply re-listed.
+    """
+
+    def __init__(self) -> None:
+        self.snaps: dict[BoardRef, Snapshot] = {}
+
+    async def refresh(self, acct: Account, refs, force: bool = False) -> set[BoardRef]:
+        """Bring `refs` up to date. Returns the boards whose contents changed."""
+        changed: set[BoardRef] = set()
+        by_via: dict[str, list[BoardRef]] = {}
+        for r in refs:
+            by_via.setdefault(r.via, []).append(r)
+        for via, group in by_via.items():
+            try:
+                async with Session.open(acct, via).reader() as c:
+                    heads: dict[str, int | None] = {}
+                    for origin in {r.origin for r in group}:
+                        try:
+                            heads[origin] = (await c.get_head(origin)).latest_origin_seq
+                        except (ProtocolError, FirehoseClientError):
+                            heads[origin] = None
+                    for ref in group:
+                        head = heads[ref.origin]
+                        old = self.snaps.get(ref)
+                        if not force and old is not None and head is not None and old.head_seq == head:
+                            continue
+                        try:
+                            rows = await _list_all(c, ref.origin, ref.name)
+                        except ProtocolError:
+                            continue
+                        rows.sort(key=lambda r: r.article_num)
+                        if old is None or [(r.article_num, r.visibility, r.subject) for r in old.rows] != [
+                            (r.article_num, r.visibility, r.subject) for r in rows
+                        ]:
+                            changed.add(ref)
+                        self.snaps[ref] = Snapshot(ref, rows, head)
+            except (ProtocolError, FirehoseClientError, OSError):
+                continue
+        return changed
+
+    def rows(self, ref: BoardRef) -> list:
+        snap = self.snaps.get(ref)
+        return snap.rows if snap else []
+
+
+def thread_key(row) -> str:
+    """The article ID of the thread a row belongs to."""
+    return row.article_id if is_zero(row.root_article_id) else row.root_article_id
+
+
+# ---------------------------------------------------------------------------
+# Unread and inbox
+# ---------------------------------------------------------------------------
+
+
+def read_state(acct: Account):
+    from scootaloo.readstate import ReadState
+
+    return ReadState(acct.stores.state_path)
+
+
+def unread(acct: Account, index: Index, refs=None) -> dict[BoardRef, set[int]]:
+    """Unread article numbers per board, for boards the index holds."""
+    out = {}
+    with read_state(acct) as st:
+        for ref in refs if refs is not None else list(index.snaps):
+            rows = index.rows(ref)
+            out[ref] = st.unread(ref.origin, ref.name, [r.article_num for r in rows])
+    return out
+
+
+def unread_threads(index: Index, ref: BoardRef, unread_nums: set[int]) -> dict[str, int]:
+    """Unread count per thread (keyed by root article ID)."""
+    counts: dict[str, int] = {}
+    for r in index.rows(ref):
+        if r.article_num in unread_nums:
+            k = thread_key(r)
+            counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def mark_read(acct: Account, ref: BoardRef, nums) -> None:
+    with read_state(acct) as st:
+        st.mark(ref.origin, ref.name, nums)
+
+
+def mark_board_read(acct: Account, index: Index, ref: BoardRef) -> None:
+    with read_state(acct) as st:
+        st.mark_all(ref.origin, ref.name, [r.article_num for r in index.rows(ref)])
+
+
+def my_keys(acct: Account) -> set[str]:
+    """Every public key this user holds, on any relay."""
+    s = acct.stores.identities()
+    try:
+        return {r["public_key"] for r in s.list_users()}
+    finally:
+        s.close()
+
+
+@dataclass
+class InboxItem:
+    ref: BoardRef
+    row: object  # the reply
+    parent: object  # your article it answers
+    unread: bool
+
+
+def inbox(acct: Account, index: Index) -> list[InboxItem]:
+    """Replies to your articles, by anyone else, on every board the index holds. Newest first."""
+    mine = my_keys(acct)
+    unread_by = unread(acct, index)
+    items = []
+    for ref, snap in index.snaps.items():
+        own = {r.article_id: r for r in snap.rows if r.author_pubkey in mine}
+        if not own:
+            continue
+        for r in snap.rows:
+            parent = own.get(r.reply_to_article_id)
+            if parent is not None and r.author_pubkey not in mine:
+                items.append(InboxItem(ref, r, parent, r.article_num in unread_by.get(ref, set())))
+    items.sort(key=lambda i: (i.row.created_at, i.row.article_num), reverse=True)
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Editing and deleting your own articles
+# ---------------------------------------------------------------------------
+
+
+def _my_key_on(sess: Session) -> str:
+    s = sess.acct.stores.identities()
+    try:
+        pub = s.get_pubkey(sess.origin, sess.username or "")
+    finally:
+        s.close()
+    return pub.hex() if pub else ""
+
+
+async def _own_article(c, sess: Session, ref: BoardRef, num: int):
+    try:
+        v = await c.get_article(ref.origin, ref.name, num, include_body=True)
+    except ProtocolError as e:
+        if e.code == _MISSING:
+            raise ScootalooError(f"no article #{num} in {ref.label}") from e
+        raise
+    if v.author_pubkey != _my_key_on(sess):
+        who = v.author_username or v.author_pubkey[:12]
+        raise ScootalooError(f"#{num} is {who}'s, not {sess.username}'s: you can only change your own posts")
+    if v.visibility != "active":
+        raise ScootalooError(f"#{num} is {v.visibility}; only a live article can be changed")
+    return v
+
+
+async def edit(
+    acct: Account, ref: BoardRef, num: int, body: str, subject: str | None = None, username: str | None = None,
+) -> PublishResult:
+    """Supersede your article #num: a new article replaces it in place, keeping its thread position."""
+    sess = writable(acct, ref, username)
+    async with sess.writer() as c:
+        old = await _own_article(c, sess, ref, num)
+        return await c.publish_article(
+            ref.name, os.urandom(32), body.encode("utf-8"), (subject or old.subject).strip(),
+            content_type=old.content_type or "text/markdown",
+            tags=[t for t in (old.tags or "").split(",") if t] or None,
+            root_article_id=None if is_zero(old.root_article_id) else bytes.fromhex(old.root_article_id),
+            reply_to_article_id=None if is_zero(old.reply_to_article_id) else bytes.fromhex(old.reply_to_article_id),
+            supersedes_article_id=bytes.fromhex(old.article_id),
+        )
+
+
+async def current_body(acct: Account, ref: BoardRef, num: int) -> tuple[str, str]:
+    """(subject, body) of an article, for pre-filling an editor."""
+    item = await article(acct, ref, num)
+    return item.view.subject, item.body or ""
+
+
+async def delete(acct: Account, ref: BoardRef, num: int, reason: str = "", username: str | None = None) -> PublishResult:
+    """Cancel your article #num. Bonnet keeps the record; the article stops showing."""
+    sess = writable(acct, ref, username)
+    async with sess.writer() as c:
+        old = await _own_article(c, sess, ref, num)
+        try:
+            return await c.publish_cancel("", ref.origin, ref.name, bytes.fromhex(old.article_id), reason)
+        except ProtocolError as e:
+            if e.code == _DENIED:
+                raise ScootalooError(
+                    f"{ref.origin} doesn't let users delete posts (its ACL doesn't grant "
+                    "bonnet.article.cancel). You can still edit it."
+                ) from e
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Hit:
+    ref: BoardRef
+    article_num: int
+    subject: str
+    author: str
+    created_at: int
+    excerpt: str = ""
+
+
+async def search(acct: Account, refs, query: str, limit: int = 50, index: Index | None = None) -> list[Hit]:
+    """Search subjects (and bodies, where the server indexes them) on each board in `refs`.
+
+    Where a server's ACL refuses ARTICLE_SEARCH, falls back to matching
+    subjects and author names in the board listing, case-insensitively.
+    """
+    q = query.strip()
+    if not q:
+        raise ScootalooError("search for what?")
+    hits: list[Hit] = []
+    by_via: dict[str, list[BoardRef]] = {}
+    for r in refs:
+        by_via.setdefault(r.via, []).append(r)
+    for via, group in by_via.items():
+        async with Session.open(acct, via).reader() as c:
+            body_search = "bonnet.per-board-body-search" in (getattr(c.discovery, "capabilities", None) or [])
+            for ref in group:
+                found: dict[int, Hit] = {}
+                try:
+                    queries = [(q, "")] + ([("", q)] if body_search else [])
+                    for meta, body in queries:
+                        res = await c.search_articles(ref.origin, ref.name, meta, body, 0, limit)
+                        for r in res.results:
+                            found.setdefault(r.article_num, Hit(
+                                ref, r.article_num, r.subject, author_label(r), r.created_at, r.excerpt or "",
+                            ))
+                except ProtocolError as e:
+                    if e.code != _DENIED:
+                        raise
+                    rows = index.rows(ref) if index and ref in index.snaps else await _list_all(c, ref.origin, ref.name)
+                    needle = q.casefold()
+                    for r in rows:
+                        if needle in (r.subject or "").casefold() or needle in (r.author_username or "").casefold():
+                            found.setdefault(r.article_num, Hit(ref, r.article_num, r.subject, author_label(r), r.created_at))
+                hits.extend(found.values())
+    hits.sort(key=lambda h: (h.created_at, h.article_num), reverse=True)
+    return hits[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Verification: check the signed record behind an article view
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Verification:
+    ref: BoardRef
+    article_num: int
+    event_id: str
+    origin_seq: int
+    author_key: str
+    author_sig: str  # valid | invalid
+    origin_sig: str  # valid | invalid | unverifiable
+    body: str  # matches | mismatch | absent | unavailable
+    view_matches: bool  # does the relay's summary agree with the signed record?
+    mismatches: list[str]
+    hops: list[dict]
+
+    @property
+    def ok(self) -> bool:
+        return (
+            self.author_sig == "valid"
+            and self.origin_sig == "valid"
+            and self.body in ("matches", "absent")
+            and self.view_matches
+            and all(h["signature_valid"] for h in self.hops)
+        )
+
+
+async def verify(acct: Account, ref: BoardRef, num: int) -> Verification:
+    """Fetch the signed record behind article #num and check it here, not on the relay's word.
+
+    - the author's signature over what they published,
+    - the origin's countersignature (needs that origin's key history, which
+      this client only has for origins you've accepted a key for),
+    - the body bytes against the hash the author signed,
+    - the relay's article view against the record it claims to summarize,
+    - every relay's signed witness of handing the record on.
+    """
+    from bonnet.core.record import compute_body_hash, ZERO_HASH
+
+    async with session_for(acct, ref).reader() as c:
+        v = await c.get_article(ref.origin, ref.name, num, include_body=True)
+        try:
+            await c.refresh_epoch_cache(ref.origin)
+        except Exception:  # noqa: BLE001 — best effort, as in Bonnet itself
+            pass
+        rec, _ = await c.get_event(ref.origin, bytes.fromhex(v.event_id))
+        sigs = c.verify_record(rec)
+        hops = await c.trace_event(ref.origin, bytes.fromhex(v.event_id))
+
+        if rec.body_size == 0:
+            body_state = "absent"
+        else:
+            raw = v.body
+            if raw is None and v.body_state != "purged":
+                try:
+                    raw = await c.get_article_body(ref.origin, ref.name, num)
+                except (ProtocolError, FirehoseClientError, OSError):
+                    raw = None
+            if raw is None:
+                body_state = "unavailable"
+            else:
+                body_state = "matches" if compute_body_hash(raw) == rec.body_hash else "mismatch"
+
+    mismatches = []
+    if v.author_pubkey != rec.actor_pubkey.hex():
+        mismatches.append("author key")
+    if v.article_id != rec.article_id.hex():
+        mismatches.append("article ID")
+    if v.body_hash and v.body_hash != rec.body_hash.hex() and rec.body_hash != ZERO_HASH:
+        mismatches.append("body hash")
+    if rec.board != ref.name or rec.origin != ref.origin:
+        mismatches.append("board or origin")
+    subj = next((f for f in rec.metadata.fields if f.field_id == 1), None)
+    if subj is not None:
+        signed_subject = subj.value.decode("utf-8", errors="replace") if isinstance(subj.value, bytes) else str(subj.value)
+        if signed_subject != v.subject:
+            mismatches.append("subject")
+    return Verification(
+        ref=ref, article_num=num, event_id=v.event_id, origin_seq=rec.origin_seq,
+        author_key=rec.actor_pubkey.hex(), author_sig=sigs["author"], origin_sig=sigs["origin"],
+        body=body_state, view_matches=not mismatches, mismatches=mismatches, hops=hops,
+    )

@@ -54,6 +54,23 @@ If the name only exists on one origin, plain `lounge` is enough. When several re
 
 **Posting only happens on a board's own origin**, as an identity you hold there. Through any other relay a board is read-only, and scootaloo says so rather than failing halfway.
 
+## Unread and inbox
+
+The first time you see a board, everything already on it counts as read, so joining a busy relay doesn't bury you. After that, anything new is unread until you open its thread. Unread state is per user.
+
+- `scootaloo unread` lists boards with unread posts; `ls` marks unread threads with `●`.
+- `scootaloo inbox` lists replies to your posts from anyone else, on every board you can read (`-a` includes ones you've read).
+- `scootaloo mark BOARD` marks a whole board read.
+
+The TUI shows unread counts on boards and an **Inbox** at the top of the board tree, and checks for new posts every 20 seconds. Each check is one small request per origin (its log head); a board is only reloaded when its origin has published something new.
+
+## Editing, deleting, searching, verifying
+
+- `scootaloo edit BOARD NUM` opens your post in `$EDITOR` (or takes `-m`). Bonnet keeps the old version as superseded; the new one takes its place in the thread.
+- `scootaloo delete BOARD NUM` cancels your post. Bonnet's stock ACL doesn't grant `bonnet.article.cancel` to ordinary users, so on many servers this is refused. scootaloo tells you so, and you can still edit.
+- `scootaloo search QUERY [BOARD]` searches subjects (and bodies, where the server indexes them) on one board or all of them. If a server refuses searches, scootaloo matches subjects and author names from the board listing instead.
+- `scootaloo verify BOARD NUM` doesn't take the relay's word for an article. It fetches the signed record behind it and checks the author's signature, the origin's countersignature, the body against the hash the author signed, the relay's summary against the record, and each relay's signed witness of passing it on. The origin signature can only be checked for origins whose key you've accepted.
+
 ## Commands
 
 | command | what it does |
@@ -71,6 +88,13 @@ If the name only exists on one origin, plain `lounge` is enough. When several re
 | `scootaloo post BOARD -s SUBJECT` | start a thread |
 | `scootaloo reply BOARD NUM` | reply to an article |
 | `scootaloo tail BOARD [-i SECS]` | watch a board for new posts |
+| `scootaloo unread` | boards with unread posts |
+| `scootaloo inbox [-a]` | replies to your posts |
+| `scootaloo mark BOARD` | mark a board read |
+| `scootaloo edit BOARD NUM` | edit your own post |
+| `scootaloo delete BOARD NUM [-y]` | delete your own post |
+| `scootaloo search QUERY [BOARD]` | search one board, or all |
+| `scootaloo verify BOARD NUM` | check the signatures behind an article |
 | `scootaloo tui` | the full-screen client (same as plain `scootaloo`) |
 
 `post` and `reply` take the body from `-m TEXT`, then `-f FILE`, then stdin if something is piped in, and otherwise open `$EDITOR` (Notepad on Windows). Bodies are sent as `text/markdown` unless you pass `--content-type`.
@@ -87,7 +111,12 @@ Log in, then: boards grouped by origin on the left, threads in the middle, the o
 | `tab` | move between panes |
 | `n` | new thread |
 | `c` | reply to the focused post (or the thread's root) |
-| `r` | refresh |
+| `e` | edit the focused post (yours) |
+| `d` | delete the focused post (yours) |
+| `/` | search this board (or all boards, from the inbox) |
+| `v` | verify the focused post |
+| `m` | mark this board (or the inbox) read |
+| `r` | refresh everything |
 | `o` | connect to a relay |
 | `i` | pick or register the identity you post as |
 | `ctrl+l` | switch user |
@@ -106,14 +135,24 @@ current                       the last user to log in (a name, not a secret)
 users/<name>/identities.db    Bonnet identities (keys encrypted with the user's password)
 users/<name>/origins.db       joined relays
 users/<name>/trust.db         accepted origin keys
+users/<name>/state.db         what you've read
 ```
 
 **`--gateway-store`** skips local users and uses the Bonnet MCP gateway's own store instead (`$BONNET_GATEWAY_HOME`), so identities you made there work here. Nothing is copied between the two stores.
 
+## Development
+
+```
+uv sync --group dev
+uv run pytest
+```
+
+The tests start two real Bonnet servers (`alpha.test` and `beta.test`) that federate with each other, so they need `openssl` on your PATH to make the servers' certificates. A full run takes a few minutes, mostly because Bonnet's key-wrapping KDFs are deliberately slow.
+
 ## Not yet
 
 - Posting to `~` bridge boards. Those are crossposts to an outside venue, so for now use the MCP gateway.
-- Moderation commands (pin, close, cancel, punish).
+- Moderation commands (pin, close, punish), and deleting other people's posts as a moderator.
 
 ## License
 

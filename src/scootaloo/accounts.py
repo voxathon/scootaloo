@@ -8,6 +8,7 @@ scootaloo is an application, so it has local users. Each user has a password
     <home>/users/<name>/identities.db   Bonnet identities, keys wrapped with the user's password
     <home>/users/<name>/origins.db      relays this user has joined
     <home>/users/<name>/trust.db        origin keys this user has accepted
+    <home>/users/<name>/state.db        what this user has read (scootaloo's own)
 
 Pins and joined origins are per user on purpose: accepting a key is a trust
 decision, and one person's decision shouldn't commit another.
@@ -61,6 +62,7 @@ class Stores:
     origins_path: str
     trust_path: str
     label: str
+    state_path: str = ""
 
     @classmethod
     def for_user(cls, name: str) -> "Stores":
@@ -71,6 +73,7 @@ class Stores:
             os.path.join(d, "origins.db"),
             os.path.join(d, "trust.db"),
             label=name,
+            state_path=os.path.join(d, "state.db"),
         )
 
     @classmethod
@@ -80,7 +83,9 @@ class Stores:
         paths = [identities_db_path(DEFAULT_TENANT), origins_db_path(DEFAULT_TENANT), trust_db_path(DEFAULT_TENANT)]
         for p in paths:
             os.makedirs(os.path.dirname(p), exist_ok=True)
-        return cls(*paths, label="gateway store")
+        # Read state is scootaloo's own, so it stays in scootaloo's home even here.
+        state = os.path.join(home(), "gateway-store-state.db")
+        return cls(*paths, label="gateway store", state_path=state)
 
     def identities(self) -> IdentityStore:
         return IdentityStore(self.identities_path)

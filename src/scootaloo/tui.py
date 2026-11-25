@@ -280,16 +280,61 @@ class Login(Screen[Account]):
         self.dismiss(acct)
 
 
+class YesNo(ModalScreen[bool]):
+    BINDINGS = [Binding("escape", "no", "No"), Binding("y", "yes", "Yes")]
+
+    def __init__(self, question: str):
+        super().__init__()
+        self.question = question
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label(self.question)
+            with Horizontal(id="compose-buttons"):
+                yield Button("Yes (y)", variant="error", id="yes")
+                yield Button("No (esc)", id="no")
+
+    def on_mount(self) -> None:
+        self.query_one("#no", Button).focus()
+
+    @on(Button.Pressed, "#yes")
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#no")
+    def action_no(self) -> None:
+        self.dismiss(False)
+
+
+class Show(ModalScreen[None]):
+    """Read-only text (verification results). Any of esc / enter / q closes it."""
+
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("enter", "close", "Close"), Binding("q", "close", "Close")]
+
+    def __init__(self, markup: str):
+        super().__init__()
+        self.markup = markup
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(classes="dialog", id="show"):
+            yield Static(self.markup)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 # ---------------------------------------------------------------------------
 # app
 # ---------------------------------------------------------------------------
+
+INBOX = "inbox"
 
 
 class ScootalooApp(App):
     TITLE = "scootaloo"
     CSS = """
     #panes { height: 1fr; }
-    #boards { width: 30; height: 1fr; border-right: solid $primary-darken-2; }
+    #boards { width: 32; height: 1fr; border-right: solid $primary-darken-2; }
     #threads { width: 1fr; height: 1fr; }
     #view { width: 1fr; border-left: solid $primary-darken-2; padding: 0 1; }
     #status { height: 1; background: $boost; color: $text-muted; padding: 0 1; }
@@ -306,8 +351,8 @@ class ScootalooApp(App):
     #body { height: 1fr; }
     #compose-buttons { height: auto; margin-top: 1; }
     #compose-buttons Button { margin-right: 2; }
-    Ask, TrustKey { align: center middle; }
-    .dialog { width: 80; height: auto; border: thick $primary; background: $surface; padding: 1 2; }
+    Ask, TrustKey, YesNo, Show { align: center middle; }
+    .dialog { width: 90; height: auto; max-height: 90%; border: thick $primary; background: $surface; padding: 1 2; }
     #fingerprint { margin: 1 0; }
     Login { align: center middle; }
     #login { width: 60; height: auto; border: thick $primary; background: $surface; padding: 1 2; }
@@ -319,21 +364,38 @@ class ScootalooApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
-        Binding("n", "new_thread", "New thread"),
+        Binding("n", "new_thread", "New"),
         Binding("c", "reply", "Reply"),
+        Binding("e", "edit", "Edit"),
+        Binding("d", "delete", "Delete"),
+        Binding("slash", "search", "Search"),
+        Binding("v", "verify", "Verify"),
+        Binding("m", "mark_read", "Mark read"),
         Binding("o", "connect", "Connect"),
         Binding("i", "identity", "Identity"),
-        Binding("ctrl+l", "switch_user", "Switch user"),
+        Binding("ctrl+l", "switch_user", "User"),
         Binding("ctrl+k", "change_password", "Password", show=False),
     ]
+
+    REFRESH_SECONDS = 20
 
     def __init__(self, user: str | None = None, password: str | None = None,
                  gateway_store: bool = False, relay: str | None = None):
         super().__init__()
         self._user, self._password, self._gateway, self._relay = user, password, gateway_store, relay
         self.acct: Account | None = None
-        self.ref: core.BoardRef | None = None
+        self.index = core.Index()
+        self.refs: list[core.BoardRef] = []
+        self.unread_map: dict[core.BoardRef, set[int]] = {}
+        self.inbox_items: list[core.InboxItem] = []
+        self.nodes: dict[core.BoardRef, object] = {}
+        self.inbox_node = None
+        self.ref: core.BoardRef | None = None  # board selected in the tree
+        self.mode = "board"  # board | inbox | search
+        self.search_label = ""
+        self.rowmap: dict[str, tuple[core.BoardRef, int]] = {}
         self.thread: core.Thread | None = None
+        self._busy = False
 
     # -- layout ---------------------------------------------------------------
 
@@ -352,23 +414,35 @@ class ScootalooApp(App):
         tree = self.query_one("#boards", Tree)
         tree.show_root = False
         t = self.query_one("#threads", DataTable)
+        t.add_column("", key="new", width=3)
         t.add_column("#", key="num", width=5)
         t.add_column("subject", key="subject", width=28)
         t.add_column("author", key="author", width=14)
         t.add_column("date", key="when", width=5)
         self.start()
-        self.set_interval(60, self._auto_refresh)
+        self.set_interval(self.REFRESH_SECONDS, self._tick)
+
+    @property
+    def target_ref(self) -> core.BoardRef | None:
+        """The board actions apply to: the open thread's, else the selected board."""
+        if self.thread:
+            return self.thread.ref
+        return self.ref if self.mode == "board" else None
 
     def set_status(self) -> None:
         if not self.acct:
             self.query_one("#status", Static).update("not logged in")
             return
         parts = [self.acct.name]
-        if self.ref:
-            parts.append(self.ref.label + ("" if self.ref.is_home else f" via {self.ref.via}"))
+        if self.mode == "inbox":
+            parts.append("inbox")
+        elif self.mode == "search":
+            parts.append(f"search: {self.search_label}")
+        ref = self.target_ref
+        if ref:
+            parts.append(ref.label + ("" if ref.is_home else f" via {ref.via}"))
             try:
-                sess = core.writable(self.acct, self.ref)
-                parts.append(f"posting as {sess.username}")
+                parts.append(f"posting as {core.writable(self.acct, ref).username}")
             except core.ScootalooError:
                 parts.append("read-only here")
         elif not core.joined(self.acct):
@@ -394,7 +468,8 @@ class ScootalooApp(App):
         await self._enter(acct)
 
     async def _enter(self, acct: Account) -> None:
-        self.acct, self.ref, self.thread = acct, None, None
+        self.acct, self.ref, self.thread, self.mode = acct, None, None, "board"
+        self.index = core.Index()
         self.query_one("#threads", DataTable).clear()
         await self._clear_view("pick a thread")
         if self._relay:
@@ -472,7 +547,8 @@ class ScootalooApp(App):
         """Pick or register the identity you post as on the relay you're looking at."""
         if not self.acct:
             return
-        relay = self.ref.via if self.ref else (core.active_relay(self.acct) or {}).get("origin")
+        ref = self.target_ref
+        relay = ref.via if ref else (core.active_relay(self.acct) or {}).get("origin")
         if not relay:
             self.notify("connect to a relay first (o)", severity="warning")
             return
@@ -506,14 +582,37 @@ class ScootalooApp(App):
             self.notify(str(e), severity="error", timeout=8)
         return None
 
+    def _recount(self) -> None:
+        self.unread_map = core.unread(self.acct, self.index, self.refs)
+        self.inbox_items = core.inbox(self.acct, self.index)
+
+    def _relabel(self) -> None:
+        for ref, node in self.nodes.items():
+            n = len(self.unread_map.get(ref, ()))
+            style = "dim" if ref.closed else ("magenta" if ref.name.startswith("~") else "")
+            label = Text(ref.name + (f" ({n})" if n else ""), style=style)
+            if n:
+                label.stylize("bold")
+            node.set_label(label)
+        if self.inbox_node is not None:
+            n = sum(1 for i in self.inbox_items if i.unread)
+            label = Text("Inbox" + (f" ({n})" if n else ""), style="bold yellow" if n else "")
+            self.inbox_node.set_label(label)
+
     async def load_boards(self) -> None:
         if not self.acct:
             return
         refs = await self._guard(core.all_boards(self.acct))
         if refs is None:
             return
+        self.refs = refs
+        await self._guard(self.index.refresh(self.acct, refs))
+        self._recount()
+
         tree = self.query_one("#boards", Tree)
         tree.clear()
+        self.nodes = {}
+        self.inbox_node = tree.root.add_leaf("Inbox", data=INBOX)
         by_origin: dict[str, list[core.BoardRef]] = {}
         for ref in refs:
             by_origin.setdefault(ref.origin, []).append(ref)
@@ -525,122 +624,265 @@ class ScootalooApp(App):
             label.stylize("dim", len(origin))
             node = tree.root.add(label, expand=True)
             for ref in rows:
-                style = "dim" if ref.closed else ("magenta" if ref.name.startswith("~") else "")
-                leaf = node.add_leaf(Text(ref.name, style=style), data=ref)
-                if first is None and ref.is_home and ref.name == "general":
+                leaf = node.add_leaf(ref.name, data=ref)
+                self.nodes[ref] = leaf
+                if ref.is_home and not ref.name.startswith("~") and (first is None or ref.name == "general"):
                     first = leaf
-                if first is None and ref.is_home and not ref.name.startswith("~"):
-                    first = leaf
+        self._relabel()
         tree.focus()
-        if self.ref:
-            keep = next((leaf for n in tree.root.children for leaf in n.children if leaf.data == self.ref), None)
-            first = keep or first
+        if self.ref and self.ref in self.nodes:
+            first = self.nodes[self.ref]
         if first is not None:
             tree.move_cursor(first)
-            if self.ref != first.data:
+            if self.mode == "board" and self.ref != first.data:
                 self.open_board(first.data)
 
     @on(Tree.NodeSelected, "#boards")
     def board_selected(self, ev: Tree.NodeSelected) -> None:
-        if isinstance(ev.node.data, core.BoardRef):
+        if ev.node.data == INBOX:
+            self.show_inbox()
+        elif isinstance(ev.node.data, core.BoardRef):
             self.open_board(ev.node.data)
+
+    # -- the middle pane: a board, the inbox, or search results ----------------
+
+    def _fill(self, rows: list[tuple[str, int, int, str, str, int, core.BoardRef]]) -> None:
+        """rows: (key, unread count, num, subject, author, timestamp, ref)."""
+        t = self.query_one("#threads", DataTable)
+        t.clear()
+        self.rowmap = {}
+        for key, n, num, subject, author, ts, ref in rows:
+            subj = subject if len(subject) <= 28 else subject[:27] + "…"
+            t.add_row(
+                Text(f"●{n}" if n > 1 else ("●" if n else ""), style="yellow"),
+                str(num), Text(subj, style="bold" if n else ""), author,
+                datetime.fromtimestamp(ts).strftime("%m-%d"), key=key,
+            )
+            self.rowmap[key] = (ref, num)
+
+    def _render_board(self) -> None:
+        ref = self.ref
+        rows = self.index.rows(ref)
+        per_thread = core.unread_threads(self.index, ref, self.unread_map.get(ref, set()))
+        roots = sorted((r for r in rows if core.is_zero(r.root_article_id)),
+                       key=lambda r: (r.pin_state != "pinned", -r.created_at, -r.article_num))
+        self._fill([
+            (f"b{r.article_num}", per_thread.get(r.article_id, 0), r.article_num,
+             ("📌 " if r.pin_state == "pinned" else "") + (r.subject or ""), core.author_label(r), r.created_at, ref)
+            for r in roots
+        ])
+
+    def _render_inbox(self) -> None:
+        self._fill([
+            (f"i{k}", 1 if it.unread else 0, it.row.article_num, f"{it.ref.name}: {it.row.subject}",
+             core.author_label(it.row), it.row.created_at, it.ref)
+            for k, it in enumerate(self.inbox_items)
+        ])
 
     @work(exclusive=True, group="threads")
     async def open_board(self, ref: core.BoardRef) -> None:
-        if ref != self.ref:
+        if ref != self.ref or self.mode != "board":
             self.thread = None
             await self._clear_view("pick a thread")
-        self.ref = ref
+        self.ref, self.mode = ref, "board"
         self.set_status()
-        rows = await self._guard(core.articles(self.acct, ref, 100))
-        t = self.query_one("#threads", DataTable)
-        t.clear()
-        for a in rows or []:
-            subj = ("📌 " if a.pin_state == "pinned" else "") + (a.subject or "")
-            subj = subj if len(subj) <= 28 else subj[:27] + "…"
-            t.add_row(
-                str(a.article_num), subj, core.author_label(a),
-                datetime.fromtimestamp(a.created_at).strftime("%m-%d"), key=str(a.article_num),
-            )
+        await self._guard(self.index.refresh(self.acct, [ref]))
+        self.unread_map[ref] = core.unread(self.acct, self.index, [ref])[ref]
+        self._render_board()
+        self._relabel()
+
+    @work(exclusive=True, group="threads")
+    async def show_inbox(self) -> None:
+        self.mode, self.thread = "inbox", None
+        await self._clear_view("replies to your posts, newest first")
+        self.set_status()
+        self._render_inbox()
+
+    @on(DataTable.RowSelected, "#threads")
+    def thread_selected(self, ev: DataTable.RowSelected) -> None:
+        ref, num = self.rowmap[ev.row_key.value]
+        self.open_thread(ref, num)
 
     async def _clear_view(self, msg: str) -> None:
         view = self.query_one("#view", VerticalScroll)
         await view.remove_children()
         await view.mount(Static(msg, id="empty"))
 
-    @on(DataTable.RowSelected, "#threads")
-    def thread_selected(self, ev: DataTable.RowSelected) -> None:
-        self.open_thread(int(ev.row_key.value))
-
     @work(exclusive=True, group="view")
-    async def open_thread(self, num: int, focus_num: int | None = None) -> None:
-        ref = self.ref
+    async def open_thread(self, ref: core.BoardRef, num: int, focus_num: int | None = None) -> None:
         await self._clear_view("loading…")
         th = await self._guard(core.thread(self.acct, ref, num))
         view = self.query_one("#view", VerticalScroll)
         await view.remove_children()
-        if th is None or ref != self.ref:
+        if th is None:
             return
         self.thread = th
         posts = [Post(item) for item in th.items]
         await view.mount_all(posts)
         if th.truncated:
             await view.mount(Static("thread truncated at 200 articles", id="empty"))
-        target = next((p for p in posts if p.item.view.article_num == focus_num), None)
-        if target:
+        target = next((p for p in posts if p.item.view.article_num in (focus_num, num)), None)
+        if target and (focus_num or target.item.depth):
             target.focus()
             view.scroll_to_widget(target)
         else:
             view.scroll_home(animate=False)
+        core.mark_read(self.acct, ref, [i.view.article_num for i in th.items])
+        self._recount()
+        self._relabel()
+        self._rerender_list()
+        self.set_status()
+
+    def _rerender_list(self) -> None:
+        t = self.query_one("#threads", DataTable)
+        cursor = t.cursor_row
+        if self.mode == "board" and self.ref:
+            self._render_board()
+        elif self.mode == "inbox":
+            self._render_inbox()
+        else:
+            return
+        if t.row_count:
+            t.move_cursor(row=min(cursor, t.row_count - 1), animate=False)
+
+    # -- refreshing ----------------------------------------------------------
 
     def action_refresh(self) -> None:
         if not self.acct:
             return
-        self.run_worker(self.load_boards())
-        if self.ref:
-            self.open_board(self.ref)
-        if self.thread:
-            self.open_thread(self.thread.root.article_num)
 
-    def _auto_refresh(self) -> None:
-        if self.acct and self.ref and not isinstance(self.screen, (ModalScreen, Login)):
-            self.open_board(self.ref)
+        async def full():
+            await self.load_boards()
+            if self.thread:
+                self.open_thread(self.thread.ref, self.thread.root.article_num)
+
+        self.run_worker(full(), exclusive=True, group="refresh")
+
+    def _tick(self) -> None:
+        if self.acct and self.refs and not self._busy and not isinstance(self.screen, (ModalScreen, Login)):
+            self.run_worker(self._poll(), exclusive=True, group="refresh")
+
+    async def _poll(self) -> None:
+        """Cheap: one head request per origin; boards are re-listed only when their origin moved."""
+        self._busy = True
+        try:
+            before = sum(len(v) for v in self.unread_map.values())
+            changed = await self.index.refresh(self.acct, self.refs)
+            if not changed:
+                return
+            self._recount()
+            self._relabel()
+            self._rerender_list()
+            gained = sum(len(v) for v in self.unread_map.values()) - before
+            if gained > 0:
+                self.notify(f"{gained} new post{'s' if gained != 1 else ''}")
+        except Exception:  # noqa: BLE001 — a failed background poll just waits for the next one
+            pass
+        finally:
+            self._busy = False
+
+    # -- reading tools -------------------------------------------------------
+
+    def _focused_item(self) -> core.ThreadItem | None:
+        if not self.thread:
+            return None
+        f = self.focused
+        return f.item if isinstance(f, Post) else self.thread.items[0]
+
+    @work
+    async def action_search(self) -> None:
+        if not self.acct or not self.refs:
+            return
+        scope = [self.ref] if self.mode == "board" and self.ref else [r for r in self.refs if not r.name.startswith("~")]
+        where = scope[0].label if len(scope) == 1 else "all boards"
+        q = await self.push_screen_wait(Ask(f"search {where}"))
+        if not q:
+            return
+        hits = await self._guard(core.search(self.acct, scope, q, 100, self.index))
+        if hits is None:
+            return
+        self.mode, self.thread, self.search_label = "search", None, f"{q} in {where}"
+        await self._clear_view(f"{len(hits)} match{'es' if len(hits) != 1 else ''}")
+        self._fill([
+            (f"s{k}", 0, h.article_num, (f"{h.ref.name}: " if len(scope) > 1 else "") + (h.subject or ""),
+             h.author, h.created_at, h.ref)
+            for k, h in enumerate(hits)
+        ])
+        self.set_status()
+        self.query_one("#threads", DataTable).focus()
+
+    @work
+    async def action_verify(self) -> None:
+        item = self._focused_item()
+        if not item:
+            self.notify("open a thread first", severity="warning")
+            return
+        self.notify(f"checking #{item.view.article_num}…")
+        v = await self._guard(core.verify(self.acct, self.thread.ref, item.view.article_num))
+        if v:
+            from scootaloo.cli import verification_markup
+
+            await self.push_screen_wait(Show(verification_markup(v)))
+
+    def action_mark_read(self) -> None:
+        if self.mode == "board" and self.ref:
+            core.mark_board_read(self.acct, self.index, self.ref)
+        elif self.mode == "inbox":
+            for it in self.inbox_items:
+                core.mark_read(self.acct, it.ref, [it.row.article_num])
+        else:
+            return
+        self._recount()
+        self._relabel()
+        self._rerender_list()
 
     # -- writing -------------------------------------------------------------
 
-    def _writable(self) -> core.Session | None:
-        if not self.acct or not self.ref:
+    def _writable(self, ref: core.BoardRef | None) -> core.Session | None:
+        if not self.acct or not ref:
+            if self.mode != "board":
+                self.notify("open a board or thread first", severity="warning")
             return None
         try:
-            return core.writable(self.acct, self.ref)
+            return core.writable(self.acct, ref)
         except core.ScootalooError as e:
             self.notify(str(e), severity="warning", timeout=8)
             return None
 
+    async def _after_write(self, ref: core.BoardRef, thread_num: int | None, focus: int | None) -> None:
+        await self._guard(self.index.refresh(self.acct, [ref]))
+        if thread_num is not None:
+            core.mark_read(self.acct, ref, [n for n in (thread_num, focus) if n])
+        self._recount()
+        self._relabel()
+        self._rerender_list()
+        if thread_num is not None:
+            self.open_thread(ref, thread_num, focus_num=focus)
+
     @work
     async def action_new_thread(self) -> None:
-        sess = self._writable()
+        ref = self.ref if self.mode == "board" else None
+        sess = self._writable(ref)
         if not sess:
             return
-        res = await self.push_screen_wait(Compose(f"New thread on {self.ref.label} as {sess.username}"))
+        res = await self.push_screen_wait(Compose(f"New thread on {ref.label} as {sess.username}"))
         if not res:
             return
-        r = await self._guard(core.post(self.acct, self.ref, res[0], res[1]))
+        r = await self._guard(core.post(self.acct, ref, res[0], res[1]))
         if r:
             self.notify(f"posted #{r.article_num}")
-            self.open_board(self.ref)
-            self.open_thread(r.article_num)
+            await self._after_write(ref, r.article_num, None)
 
     @work
     async def action_reply(self) -> None:
-        if self.ref and not self.thread:
+        if not self.thread:
             self.notify("open a thread first", severity="warning")
             return
-        sess = self._writable()
-        if not sess or not self.thread:
+        ref = self.thread.ref
+        sess = self._writable(ref)
+        if not sess:
             return
-        focused = self.focused
-        item = focused.item if isinstance(focused, Post) else self.thread.items[0]
+        item = self._focused_item()
         v = item.view
         quote = "\n".join("> " + ln for ln in (item.body or "").splitlines()[:12])
         subj = v.subject if v.subject.lower().startswith("re:") else "Re: " + v.subject
@@ -649,7 +891,52 @@ class ScootalooApp(App):
         )
         if not res:
             return
-        r = await self._guard(core.reply(self.acct, self.ref, v.article_num, res[1], res[0]))
+        r = await self._guard(core.reply(self.acct, ref, v.article_num, res[1], res[0]))
         if r:
             self.notify(f"replied as #{r.article_num}")
-            self.open_thread(self.thread.root.article_num, focus_num=r.article_num)
+            await self._after_write(ref, self.thread.root.article_num, r.article_num)
+
+    @work
+    async def action_edit(self) -> None:
+        item = self._focused_item()
+        if not item:
+            self.notify("open a thread and focus your post first", severity="warning")
+            return
+        ref = self.thread.ref
+        sess = self._writable(ref)
+        if not sess:
+            return
+        v = item.view
+        res = await self.push_screen_wait(Compose(f"Edit #{v.article_num} as {sess.username}", v.subject, item.body or ""))
+        if not res:
+            return
+        if res[0] == v.subject and res[1].strip() == (item.body or "").strip():
+            self.notify("no changes")
+            return
+        r = await self._guard(core.edit(self.acct, ref, v.article_num, res[1], res[0]))
+        if r:
+            self.notify(f"edited: #{v.article_num} is now #{r.article_num}")
+            root = r.article_num if item.depth == 0 else self.thread.root.article_num
+            await self._after_write(ref, root, r.article_num)
+
+    @work
+    async def action_delete(self) -> None:
+        item = self._focused_item()
+        if not item:
+            self.notify("open a thread and focus your post first", severity="warning")
+            return
+        ref = self.thread.ref
+        if not self._writable(ref):
+            return
+        v = item.view
+        if not await self.push_screen_wait(YesNo(f"Delete #{v.article_num} “{v.subject}”?")):
+            return
+        r = await self._guard(core.delete(self.acct, ref, v.article_num))
+        if r:
+            self.notify(f"deleted #{v.article_num}")
+            if item.depth == 0:
+                self.thread = None
+                await self._clear_view("deleted")
+                await self._after_write(ref, None, None)
+            else:
+                await self._after_write(ref, self.thread.root.article_num, None)
