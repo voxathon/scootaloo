@@ -1052,6 +1052,7 @@ class ScootalooApp(App):
         return counts
 
     def _post_step(self, step: int) -> None:
+        """↓/↑ in a thread: read through a post taller than the pane before moving to the next one."""
         visible = [p for p in self.posts if p.display]
         if not visible:
             return
@@ -1059,9 +1060,29 @@ class ScootalooApp(App):
         if cur not in visible:
             self._focus_post(visible[0])
             return
+        view = self.query_one("#view", VerticalScroll)
+        height = view.scrollable_content_region.height
+        stride = max(3, height // 2)  # half a pane per press, so there's always overlap to keep your place
+        region = cur.virtual_region
+        top, bottom = view.scroll_y, view.scroll_y + height
+        if step > 0 and region.bottom > bottom:
+            view.scroll_to(y=min(region.bottom - height, top + stride), animate=False)
+            return
+        if step < 0 and region.y < top:
+            view.scroll_to(y=max(region.y, top - stride), animate=False)
+            return
         i = visible.index(cur) + step
-        if 0 <= i < len(visible):
-            self._focus_post(visible[i])
+        if not 0 <= i < len(visible):
+            return
+        nxt = visible[i]
+        nxt.focus(scroll_visible=False)
+        r = nxt.virtual_region
+        if step > 0 or r.height <= height:
+            # going down, or it fits: show it from its top
+            view.scroll_to(y=r.y if r.height > height or r.y < top or r.bottom > bottom else top, animate=False)
+        else:
+            # going up into a tall post: land on its end, where you'd continue reading upwards
+            view.scroll_to(y=r.bottom - height, animate=False)
 
     def action_next_post(self) -> None:
         self._post_step(1)

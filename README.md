@@ -112,7 +112,7 @@ Log in, then: boards grouped by origin on the left, threads in the middle, the o
 | `tab` / `shift+tab` | move between panes |
 | `↑` `↓` in the list | move through threads, previewing each opening post on the right |
 | `enter` in the list | open the thread |
-| `↑` `↓` in a thread | previous / next post (skipping collapsed ones) |
+| `↑` `↓` in a thread | scroll through the focused post if it runs past the pane, then move to the previous / next post (skipping collapsed ones) |
 | `→` / `←` | expand / collapse a post; `←` on a collapsed post steps out to its parent |
 | `enter` on a post | collapse or expand it |
 | `space` | show more / less of a long post (cut at 12 lines of its text) |

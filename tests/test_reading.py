@@ -358,3 +358,44 @@ def test_enter_from_preview_keeps_the_thread(deep):
             assert app.previewing is not None and app.previewing[1] != n["op"]
 
     asyncio.run(go())
+
+
+def test_arrows_scroll_through_a_tall_post_before_moving_on(deep):
+    """Regression: an expanded post taller than the pane, last in the thread, must be readable by ↓ alone."""
+    mox, ref, n = deep
+
+    async def go():
+        app = ScootalooApp(user="moxxie", password="hunter222")
+        async with app.run_test(size=(140, 24)) as pilot:  # short window: the long reply can't fit
+            await settle(pilot, app)
+            await open_thread(pilot, app, ref, n["long"])
+            view = app.query_one("#view")
+            p = by_num(app, n["long"])
+            assert app.focused is p
+            await pilot.press("space")  # show all 30 lines
+            await pilot.pause(0.3)
+            assert p.show_all
+
+            def bottom_visible():
+                return p.virtual_region.bottom <= view.scroll_y + view.scrollable_content_region.height
+
+            presses = 0
+            while not bottom_visible() and presses < 30:
+                before = view.scroll_y
+                await pilot.press("down")
+                await pilot.pause(0.05)
+                presses += 1
+                assert app.focused is p, "↓ left the post before its end was on screen"
+                assert view.scroll_y > before, "↓ did nothing while the post continued below"
+            assert bottom_visible() and presses > 0
+
+            # ↑ scrolls back through it before moving to the post above
+            while p.virtual_region.y < view.scroll_y:
+                await pilot.press("up")
+                await pilot.pause(0.05)
+                assert app.focused is p
+            await pilot.press("up")
+            await pilot.pause(0.1)
+            assert app.focused is not p and isinstance(app.focused, Post)
+
+    asyncio.run(go())
