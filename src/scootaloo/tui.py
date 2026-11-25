@@ -28,7 +28,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from scootaloo import core, idarchive, links, settings
+from scootaloo import core, eventlog, idarchive, links, settings
 from scootaloo.accounts import Account, AccountError, Stores, Users, default_user
 
 
@@ -686,6 +686,127 @@ class ModMenu(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+SPAN_COLOURS = ["cyan", "magenta", "yellow", "green", "blue", "red", "bright_cyan", "bright_magenta"]
+
+
+class RawRecord(ModalScreen[str | None]):
+    """One record exactly as served: tinted hex, every field with its byte range, metadata, witnesses."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"), Binding("x", "close", "Close", show=False),
+        Binding("left", "step('newer')", "Newer"), Binding("right", "step('older')", "Older"),
+        Binding("c", "copy_hex", "Copy hex"), Binding("j", "copy_json", "Copy JSON"), Binding("s", "save", "Save .bin"),
+    ]
+
+    def __init__(self, event):
+        super().__init__()
+        self.event = event
+
+    def compose(self) -> ComposeResult:
+        e, r = self.event, self.event.rec
+        spans = eventlog.layout(e.raw)
+        head = Text()
+        head.append(f"#{r.origin_seq} on {r.origin} · {r.kind} · {len(e.raw)} bytes", style="bold")
+        head.append("\n")
+        head.append("✓ canonical: re-encoding gives back these exact bytes" if e.canonical
+                    else "✗ NOT canonical: these bytes don't re-encode identically", style="green" if e.canonical else "bold red")
+        head.append(f" · author signature {e.sigs.get('author', '?')} · origin signature {e.sigs.get('origin', '?')}"
+                    f" · chain {e.chain}")
+        dump = Text()
+        for off, row in eventlog.hexdump(e.raw, spans):
+            dump.append(f"{off:06x}  ", style="dim")
+            for j, (b, si) in enumerate(row):
+                dump.append(f"{b:02x}", style=SPAN_COLOURS[si % len(SPAN_COLOURS)])
+                dump.append(" " if j != 7 else "  ")
+            dump.append("   " * (16 - len(row)) + (" " if len(row) <= 8 else ""))
+            dump.append(" " + "".join(chr(b) if 32 <= b < 127 else "·" for b, _ in row) + "\n", style="dim")
+        fields = Text()
+        for i, sp in enumerate(spans):
+            fields.append(f"{sp.name:>20} ", style=SPAN_COLOURS[i % len(SPAN_COLOURS)])
+            fields.append(f"{sp.type:<7} {sp.start:>5}–{sp.end:<5} ", style="dim")
+            fields.append(f"{sp.value}\n")
+        meta = Text()
+        for f in r.metadata.fields:
+            meta.append(f"{f.field_id:>#8x} ", style="dim")
+            meta.append(f"{eventlog.meta_name(r.kind, f.field_id):<16} ", style="bold")
+            meta.append(f"{eventlog.TYPES.get(f.value_type, '?'):<9} ", style="dim")
+            meta.append(f"{eventlog.meta_value(f)}\n")
+        wit = Text()
+        for w in e.witnesses:
+            wit.append(f"{w.relay_origin or w.relay_hostname}", style="bold")
+            wit.append(f" · relay key {w.relay_pubkey.hex()[:16]}… · from "
+                       f"{w.received_from_hostname or '(origin witness)'} · seen "
+                       f"{datetime.fromtimestamp(w.seen_at):%Y-%m-%d %H:%M:%S}\n")
+        with VerticalScroll(classes="dialog", id="raw"):
+            yield Static(head)
+            yield Label(Text("bytes, tinted by field", style="bold"), classes="raw-h")
+            yield Static(dump, id="raw-hex")
+            yield Label(Text("fields, in wire order", style="bold"), classes="raw-h")
+            yield Static(fields, id="raw-fields")
+            yield Label(Text("metadata", style="bold"), classes="raw-h")
+            yield Static(meta or Text("(none)", style="dim"))
+            yield Label(Text(f"witnesses ({len(e.witnesses)})", style="bold"), classes="raw-h")
+            yield Static(wit or Text("(none)", style="dim"))
+            yield Label(Text("←/→ newer/older · c copy hex · j copy JSON · s save .bin · esc close", style="dim"))
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def action_step(self, where: str) -> None:
+        self.dismiss(where)
+
+    def action_copy_hex(self) -> None:
+        self.app.copy_to_clipboard(self.event.raw.hex())
+        self.notify("copied the record's hex")
+
+    def action_copy_json(self) -> None:
+        import json as _json
+
+        r = self.event.rec
+        d = {sp.name: sp.value for sp in eventlog.layout(self.event.raw)}
+        d["metadata"] = {f"{f.field_id}": {"name": eventlog.meta_name(r.kind, f.field_id), "value": eventlog.meta_value(f)}
+                         for f in r.metadata.fields}
+        self.app.copy_to_clipboard(_json.dumps(d, indent=2, ensure_ascii=False))
+        self.notify("copied a JSON view")
+
+    def action_save(self) -> None:
+        r = self.event.rec
+        path = os.path.join(os.path.expanduser("~"), f"{r.origin}-{r.origin_seq}.bin")
+        with open(path, "wb") as f:
+            f.write(self.event.raw)
+        self.notify(f"saved {path}")
+
+
+class Pick(ModalScreen[str | None]):
+    """Pick one of a few strings."""
+
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    def __init__(self, title: str, options: list[tuple[str, str]]):
+        super().__init__()
+        self.title_text, self.options = title, options
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label(Text(self.title_text, style="bold"))
+            ol = OptionList(id="pick")
+            for oid, label in self.options:
+                ol.add_option(Option(label, id=oid))
+            yield ol
+
+    def on_mount(self) -> None:
+        ol = self.query_one("#pick", OptionList)
+        ol.highlighted = 0
+        ol.focus()
+
+    @on(OptionList.OptionSelected, "#pick")
+    def picked(self, ev: OptionList.OptionSelected) -> None:
+        self.dismiss(ev.option.id)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 # ---------------------------------------------------------------------------
 # app
 # ---------------------------------------------------------------------------
@@ -700,6 +821,14 @@ class ScootalooApp(App):
     #tabs ContentSwitcher { height: 1fr; }
     #tabs TabPane { height: 1fr; padding: 0; }
     #reports { height: 1fr; }
+    #log-panes { height: 1fr; }
+    #log-left { width: 3fr; }
+    #log-detail { width: 2fr; border-left: solid $primary-darken-2; padding: 0 1; }
+    #log { height: 1fr; }
+    #log-status { height: auto; color: $text-muted; padding: 0 1; }
+    RawRecord, Pick { align: center middle; }
+    #raw { width: 96%; height: 92%; max-height: 92%; }
+    .raw-h { margin-top: 1; }
     #reports-note { color: $text-muted; padding: 0 1; height: auto; }
     #panes { height: 1fr; }
     #boards { width: 32; height: 1fr; border-right: solid $primary-darken-2; }
@@ -765,6 +894,12 @@ class ScootalooApp(App):
         Binding("M", "moderate", "Moderate"),
         Binding("exclamation_mark", "report_post", "Report"),
         Binding("R", "toggle_reports", "Reports"),
+        Binding("L", "toggle_log", "Log"),
+        Binding("x", "raw_record", "Raw record", show=False),
+        Binding("f", "follow", "Follow", show=False),
+        Binding("O", "log_origin", "Log origin", show=False),
+        Binding("F", "saved_filters", "Saved filters", show=False),
+        Binding("ctrl+s", "save_filter", "Save filter", show=False),
         Binding("z", "maximize_pane", "Maximize"),
         Binding("backslash", "cycle_layout", "Layout"),
         Binding("left_square_bracket", "resize(-1)", "Narrower", show=False),
@@ -818,6 +953,14 @@ class ScootalooApp(App):
                         yield DataTable(id="threads", cursor_type="row", zebra_stripes=True)
                         with VerticalScroll(id="view"):
                             yield Static("pick a thread", id="empty")
+                with TabPane("Log", id="tab-log"):
+                    with Horizontal(id="log-panes"):
+                        with Vertical(id="log-left"):
+                            yield Input(placeholder="filter: kind: cat: actor: board: target: seq: since: until: has: text: verify: chain:  (- negates)", id="log-filter")
+                            yield Static("", id="log-status")
+                            yield DataTable(id="log", cursor_type="row", zebra_stripes=True)
+                        with VerticalScroll(id="log-detail"):
+                            yield Static("pick an event", id="log-detail-body")
                 with TabPane("Reports", id="tab-reports"):
                     yield Static("", id="reports-note")
                     yield DataTable(id="reports", cursor_type="row", zebra_stripes=True)
@@ -843,6 +986,17 @@ class ScootalooApp(App):
         rt.add_column("reason")
         self.report_rows: dict[str, object] = {}
         self.report_cache: dict[str, tuple] = {}  # relay -> (log heads when fetched, rows)
+        self.logs: dict[tuple[str, str], dict[int, object]] = {}  # (relay, origin) -> seq -> Event
+        self.log_at: tuple[str, str] | None = None
+        self.log_head = 0
+        self.log_terms: list = []
+        self.log_follow = False
+        self.log_keys: dict[str, int] = {}
+        lt = self.query_one("#log", DataTable)
+        lt.add_column("", width=2)
+        lt.add_column("#", width=7)
+        lt.add_column("when", width=11)
+        lt.add_column("what")
         self.can_reports = False
         self.query_one("#tabs", TabbedContent).hide_tab("tab-reports")  # shown once the relay says we may
         self.start()
@@ -854,6 +1008,11 @@ class ScootalooApp(App):
             return False
         if action == "toggle_reports" and not self.can_reports:
             return False  # not a moderator here: no Reports tab, no key for it
+        if action in ("raw_record", "follow", "log_origin", "saved_filters", "save_filter"):
+            try:
+                return self.query_one("#tabs", TabbedContent).active == "tab-log"
+            except Exception:  # noqa: BLE001
+                return False
         return True
 
     @work(exclusive=True, group="report-access")
@@ -922,6 +1081,7 @@ class ScootalooApp(App):
         self.index = core.Index()
         self.thread_cache = {}
         self.report_cache = {}  # never carry one user's moderation view over to the next
+        self.logs, self.log_at, self.log_follow = {}, None, False
         self.previewing = None
         self._load_layout()
         self.query_one("#threads", DataTable).clear()
@@ -1491,6 +1651,8 @@ class ScootalooApp(App):
             before = sum(len(v) for v in self.unread_map.values())
             if self.can_reports and self.query_one("#tabs", TabbedContent).active == "tab-reports":
                 self.load_reports()
+            if self.log_follow and self.log_at and self.query_one("#tabs", TabbedContent).active == "tab-log":
+                await self._log_newer()
             changed = await self.index.refresh(self.acct, self.refs)
             if not changed:
                 return
@@ -1591,6 +1753,11 @@ class ScootalooApp(App):
 
     @work
     async def action_goto(self) -> None:
+        if self.query_one("#tabs", TabbedContent).active == "tab-log":
+            answer = await self.push_screen_wait(Ask("go to event # (sequence number)"))
+            if answer and answer.lstrip("#").isdigit():
+                await self._log_goto(int(answer.lstrip("#")))
+            return
         ref = self._item_ref() or (self.ref if self.mode == "board" else None)
         if ref is None:
             self.notify("pick a board first", severity="warning")
@@ -1774,6 +1941,9 @@ class ScootalooApp(App):
 
     @work
     async def action_search(self) -> None:
+        if self.query_one("#tabs", TabbedContent).active == "tab-log":
+            self.query_one("#log-filter", Input).focus()
+            return
         if not self.acct or not self.refs:
             return
         scope = [self.ref] if self.mode == "board" and self.ref else [r for r in self.refs if not r.name.startswith("~")]
@@ -1855,6 +2025,276 @@ class ScootalooApp(App):
             self.notify(f"{action}: #{v.article_num} done")
             await self._after_write(ref, self.thread.root.article_num if self.thread else v.article_num, None)
 
+    # -- event log -------------------------------------------------------------
+
+    def action_toggle_log(self) -> None:
+        tabs = self.query_one("#tabs", TabbedContent)
+        tabs.active = "tab-boards" if tabs.active == "tab-log" else "tab-log"
+
+    def _log_names(self) -> dict[str, str]:
+        names = {}
+        for snap in self.index.snaps.values():
+            for r in snap.rows:
+                if r.author_username:
+                    names[r.author_pubkey] = r.author_username
+        return names
+
+    def _log_start(self) -> None:
+        relay = self.ref.via if self.ref else (core.active_relay(self.acct) or {}).get("origin")
+        origin = self.ref.origin if self.ref else relay
+        if not relay:
+            self.query_one("#log-status", Static).update("connect to a relay first (o)")
+            return
+        if self.log_at is None:
+            prefs = settings.preferences(self.acct.stores)
+            self.query_one("#log-filter", Input).value = prefs.get("log.default_filter")
+            self._log_set_filter(prefs.get("log.default_filter"))
+        self.log_at = (relay, origin)
+        self.run_worker(self._log_load_newest(), exclusive=True, group="log")
+
+    async def _log_fetch(self, start: int, count: int = eventlog.BATCH) -> int:
+        relay, origin = self.log_at
+        async with core.Session.open(self.acct, relay).reader() as c:
+            try:
+                await c.refresh_epoch_cache(origin)
+            except Exception:  # noqa: BLE001 — best effort; origin signatures then read "unverifiable"
+                pass
+            evs = await eventlog.fetch(c, origin, start, count)
+        held = self.logs.setdefault(self.log_at, {})
+        for e in evs:
+            held[e.seq] = e
+        eventlog.check_chain(held)
+        return len(evs)
+
+    async def _log_load_newest(self) -> None:
+        relay, origin = self.log_at
+        status = self.query_one("#log-status", Static)
+        status.update(f"loading {origin}'s log…")
+        try:
+            async with core.Session.open(self.acct, relay).reader() as c:
+                self.log_head = (await c.get_head(origin)).latest_origin_seq
+            held = self.logs.get(self.log_at, {})
+            if self.log_head and self.log_head not in held:
+                await self._log_fetch(max(1, self.log_head - eventlog.BATCH + 1))
+            await self._log_fill()
+        except Exception as e:  # noqa: BLE001
+            status.update(Text(f"couldn't read {origin}'s log: {e}", style="red"))
+            return
+        self._log_render()
+
+    async def _log_fill(self, want: int = 40, max_batches: int = 20) -> None:
+        """A narrow filter keeps fetching older batches until a screenful matches or the log starts."""
+        names = self._log_names()
+        for _ in range(max_batches):
+            held = self.logs.get(self.log_at, {})
+            low = min(held, default=1)
+            shown = sum(1 for e in held.values() if eventlog.matches(self.log_terms, e, names))
+            if shown >= want or low <= 1:
+                return
+            self.query_one("#log-status", Static).update(f"searching older… {len(held)} scanned, {shown} match")
+            await self._log_fetch(max(1, low - eventlog.BATCH), min(eventlog.BATCH, low - 1))
+
+    async def _log_newer(self) -> None:
+        relay, origin = self.log_at
+        async with core.Session.open(self.acct, relay).reader() as c:
+            head = (await c.get_head(origin)).latest_origin_seq
+        if head > self.log_head:
+            before = self.log_head
+            await self._log_fetch(before + 1, min(eventlog.BATCH, head - before))
+            self.log_head = head
+            self._log_render()
+
+    async def _log_goto(self, seq: int) -> None:
+        held = self.logs.setdefault(self.log_at, {})
+        if seq not in held:
+            await self._log_fetch(max(1, seq - eventlog.BATCH // 2), eventlog.BATCH)
+        self._log_render(select=seq)
+
+    def _log_render(self, select: int | None = None) -> None:
+        held = self.logs.get(self.log_at, {})
+        names = self._log_names()
+        lt = self.query_one("#log", DataTable)
+        keep = select or (self.log_keys.get(lt.coordinate_to_cell_key((lt.cursor_row, 0)).row_key.value)
+                          if lt.row_count else None)
+        lt.clear()
+        self.log_keys = {}
+        rows = [e for _, e in sorted(held.items(), reverse=True) if eventlog.matches(self.log_terms, e, names)]
+        marks = {"ok": ("│", "green"), "break": ("✗", "bold red"), "gap": ("┆", "yellow"), "start": ("┊", "dim")}
+        for e in rows:
+            bad = e.sigs.get("author") != "valid" or e.sigs.get("origin") == "invalid" or not e.canonical
+            m, style = marks.get(e.chain, ("?", "dim"))
+            what = Text(eventlog.sentence(e.rec, names), style="bold red" if bad else "")
+            lt.add_row(Text(m, style=style), str(e.seq), datetime.fromtimestamp(e.rec.created_at).strftime("%m-%d %H:%M"),
+                       what, key=f"e{e.seq}")
+            self.log_keys[f"e{e.seq}"] = e.seq
+        if keep and f"e{keep}" in self.log_keys:
+            lt.move_cursor(row=list(self.log_keys).index(f"e{keep}"), animate=False)
+        low, high = min(held, default=0), max(held, default=0)
+        broken = sorted(s for s, e in held.items() if e.chain == "break")
+        noncanon = sum(1 for e in held.values() if not e.canonical)
+        chain = (Text(f"chain BROKEN at #{', #'.join(map(str, broken))}", style="bold red") if broken
+                 else Text(f"chain ✓ #{low}–#{high}", style="green"))
+        hidden = len(held) - len(rows)
+        st = Text(f"{self.log_at[1]} via {self.log_at[0]} · head #{self.log_head} · showing {len(rows)} of {len(held)} loaded"
+                  + (f" ({hidden} filtered out)" if hidden else "") + " · ")
+        st.append_text(chain)
+        if noncanon:
+            st.append(f" · {noncanon} non-canonical!", style="bold red")
+        if self.log_follow:
+            st.append(" · following", style="cyan")
+        self.query_one("#log-status", Static).update(st)
+
+    def _log_set_filter(self, text: str) -> bool:
+        try:
+            self.log_terms = eventlog.parse_query(text)
+            return True
+        except eventlog.QueryError as e:
+            self.query_one("#log-status", Static).update(Text(str(e), style="red"))
+            return False
+
+    @on(Input.Submitted, "#log-filter")
+    def log_filter_submitted(self, ev: Input.Submitted) -> None:
+        if self._log_set_filter(ev.value) and self.log_at:
+            async def refilter():
+                await self._log_fill()
+                self._log_render()
+
+            self.run_worker(refilter(), exclusive=True, group="log")
+            self.query_one("#log", DataTable).focus()
+
+    @on(DataTable.RowHighlighted, "#log")
+    def log_row(self, ev: DataTable.RowHighlighted) -> None:
+        if ev.row_key is None or ev.row_key.value not in self.log_keys:
+            return
+        seq = self.log_keys[ev.row_key.value]
+        self._log_detail(seq)
+        lt = self.query_one("#log", DataTable)
+        held = self.logs.get(self.log_at, {})
+        if lt.cursor_row >= lt.row_count - 1 and min(held, default=1) > 1:
+            async def older():
+                low = min(held)
+                await self._log_fetch(max(1, low - eventlog.BATCH), min(eventlog.BATCH, low - 1))
+                self._log_render()
+
+            self.run_worker(older(), exclusive=True, group="log")
+
+    def _log_detail(self, seq: int) -> None:
+        e = self.logs.get(self.log_at, {}).get(seq)
+        if e is None:
+            return
+        r, names = e.rec, self._log_names()
+        t = Text()
+        t.append(eventlog.sentence(r, names) + "\n\n", style="bold")
+        rows = [("sequence", f"#{r.origin_seq} on {r.origin}"), ("kind", r.kind), ("category", eventlog.category(r)),
+                ("when", datetime.fromtimestamp(r.created_at).strftime("%Y-%m-%d %H:%M:%S")),
+                ("actor", f"{r.actor_username or '(no name)'} · {r.actor_pubkey.hex()}"),
+                ("board", r.board or "—")]
+        if r.article_num:
+            rows.append(("article", f"#{r.article_num} · {r.article_id.hex()}"))
+        if r.target_article_id != b"\x00" * 32 or r.target_board:
+            rows.append(("target", f"{r.target_board}@{r.target_origin} · {r.target_article_id.hex()}"))
+        rows += [(eventlog.meta_name(r.kind, f.field_id), eventlog.meta_value(f)) for f in r.metadata.fields]
+        rows.append(("body", f"{r.body_size} bytes" if r.body_size else "none"))
+        for k, v in rows:
+            t.append(f"{k:>14}  ", style="dim")
+            t.append(f"{v}\n")
+        t.append("\n")
+        ok = lambda s: "green" if s in ("valid", "ok") else ("yellow" if s in ("unverifiable", "start") else "bold red")  # noqa: E731
+        t.append(f"{'author sig':>14}  ", style="dim")
+        t.append(f"{e.sigs.get('author', '?')}\n", style=ok(e.sigs.get("author")))
+        t.append(f"{'origin sig':>14}  ", style="dim")
+        t.append(f"{e.sigs.get('origin', '?')}\n", style=ok(e.sigs.get("origin")))
+        t.append(f"{'chain link':>14}  ", style="dim")
+        t.append({"ok": "links to the previous record", "break": "DOES NOT link to the previous record",
+                  "start": "previous record not loaded yet"}.get(e.chain, e.chain) + "\n", style=ok(e.chain))
+        t.append(f"{'encoding':>14}  ", style="dim")
+        t.append("canonical\n" if e.canonical else "NOT canonical\n", style="green" if e.canonical else "bold red")
+        t.append(f"{'witnesses':>14}  ", style="dim")
+        t.append(", ".join(w.relay_origin or w.relay_hostname for w in e.witnesses) + "\n")
+        t.append("\nx: raw record" + (" · enter: open it" if r.kind == "bonnet.article" or r.target_board else ""), style="dim")
+        self.query_one("#log-detail-body", Static).update(t)
+
+    @on(DataTable.RowSelected, "#log")
+    def log_selected(self, ev: DataTable.RowSelected) -> None:
+        e = self.logs.get(self.log_at, {}).get(self.log_keys.get(ev.row_key.value))
+        if e is None:
+            return
+        r = e.rec
+        if r.kind == "bonnet.article":
+            ref, aid = core.BoardRef(r.origin, r.board, self.log_at[0]), r.article_id.hex()
+        elif r.target_board and r.target_article_id != b"\x00" * 32:
+            ref, aid = core.BoardRef(r.target_origin or r.origin, r.target_board, self.log_at[0]), r.target_article_id.hex()
+        else:
+            return
+
+        async def go():
+            num = await self._guard(core.num_for_id(self.acct, ref, aid))
+            if num is not None:
+                self.query_one("#tabs", TabbedContent).active = "tab-boards"
+                self.open_thread(ref, num, focus_num=num)
+
+        self.run_worker(go())
+
+    @work
+    async def action_raw_record(self) -> None:
+        lt = self.query_one("#log", DataTable)
+        if not lt.row_count:
+            return
+        keys = list(self.log_keys)
+        i = lt.cursor_row
+        while 0 <= i < len(keys):
+            e = self.logs.get(self.log_at, {}).get(self.log_keys[keys[i]])
+            step = await self.push_screen_wait(RawRecord(e))
+            if step is None:
+                lt.move_cursor(row=i, animate=False)
+                return
+            i += -1 if step == "newer" else 1
+
+    def action_follow(self) -> None:
+        self.log_follow = not self.log_follow
+        self.notify("following the log" if self.log_follow else "stopped following")
+        if self.log_at:
+            self._log_render()
+
+    @work
+    async def action_log_origin(self) -> None:
+        opts = []
+        for relay in {r.via for r in self.refs} or {(core.active_relay(self.acct) or {}).get("origin")}:
+            for origin in sorted({r.origin for r in self.refs if r.via == relay} | {relay}):
+                opts.append((f"{relay}\x00{origin}", origin + ("" if origin == relay else f"  via {relay}")))
+        choice = await self.push_screen_wait(Pick("whose log?", opts))
+        if choice:
+            relay, origin = choice.split("\x00")
+            self.log_at = (relay, origin)
+            await self._log_load_newest()
+
+    @work
+    async def action_save_filter(self) -> None:
+        query = self.query_one("#log-filter", Input).value.strip()
+        if not query or not self._log_set_filter(query):
+            return
+        name = await self.push_screen_wait(Ask("save this filter as"))
+        if not name:
+            return
+        prefs = settings.preferences(self.acct.stores)
+        saved = [p for p in prefs.get("log.saved_filters") if p[0] != name] + [[name, query]]
+        prefs.set("log.saved_filters", saved)
+        prefs.save()
+        self.notify(f"saved filter “{name}”")
+
+    @work
+    async def action_saved_filters(self) -> None:
+        saved = settings.preferences(self.acct.stores).get("log.saved_filters")
+        if not saved:
+            self.notify("no saved filters yet (ctrl+s saves the current one)")
+            return
+        choice = await self.push_screen_wait(Pick("saved filters", [(q, f"{n}:  {q}") for n, q in saved]))
+        if choice:
+            self.query_one("#log-filter", Input).value = choice
+            if self._log_set_filter(choice):
+                await self._log_fill()
+                self._log_render()
+
     # -- reports ---------------------------------------------------------------
 
     def action_toggle_reports(self) -> None:
@@ -1867,6 +2307,11 @@ class ScootalooApp(App):
     def tab_activated(self, ev: TabbedContent.TabActivated) -> None:
         if ev.pane.id == "tab-reports" and self.acct:
             self.load_reports()
+        if ev.pane.id == "tab-log" and self.acct:
+            if self.log_at is None:
+                self._log_start()
+            self.query_one("#log", DataTable).focus()
+        self.refresh_bindings()
 
     def _reports_relay(self) -> str | None:
         return self.ref.via if self.ref else (core.active_relay(self.acct) or {}).get("origin")

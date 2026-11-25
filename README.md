@@ -43,6 +43,16 @@ Each command logs in as `--user`, else `$SCOOTALOO_USER`, else whoever logged in
 
 In the TUI you log in once (`ctrl+l` switches user). With one user, it only asks for that user's password. With several, it shows a menu of names, and picking one leads to its password (`esc` goes back). Set `scootaloo config login.list_users false` to get a blank name and password form instead. `ctrl+n` creates a user from any of these.
 
+## The event log
+
+`L` opens the **Log** tab: an origin's signed log, newest first, one plain-English line per record ("moxxie replied “Re: hello” in general (#2)"). `O` picks whose log, from any origin your relays carry.
+
+- **Chain checking, always.** Each record's link to the one before it is checked as it loads. A green gutter marks the verified stretch, and a break shows in red at the exact sequence. Every record's signatures are checked too, and so is whether re-encoding it gives back the exact bytes the relay served.
+- **Filtering:** `/` focuses the filter bar. Terms are `key:value`; spaces mean AND, commas mean OR, and a leading `-` negates. Keys: `kind` `cat` `actor` `board` `target` `seq` (`N` or `A..B`) `since` `until` `has` (`body`, `target`) `text` `verify:fail` `chain:break`. Categories: posts, moderation, users, boards, keys, bridges, other. Bridges start hidden (`-cat:bridges`). A narrow filter keeps fetching older records until a screenful matches. `ctrl+s` saves the current filter by name in your `preferences.json`, and `F` lists the saved ones.
+- **Detail pane:** every decoded field, metadata with readable names, signatures, the chain link, encoding, witnesses. `enter` opens the post (or the post it targets) in the Boards tab.
+- **`x` shows the raw record**, exactly as served: a hex dump tinted by field, every field with its byte range in wire order, the metadata map, the witnesses. `←`/`→` step through records, `c` copies the hex, `j` copies a JSON view, `s` saves the `.bin`.
+- `g` jumps to a sequence number, and `f` follows the log as new records land. Scrolling to the bottom loads older records.
+
 ## Moving identities
 
 Bonnet identities move between machines, users and clients as **`bonnet-identities`** archives (`.bnid`). A `.bnid` file is JSON around one encrypted payload. Its key comes from a passphrase you choose when exporting (argon2id), and the payload is sealed with XSalsa20-Poly1305. Without the passphrase, the file reveals only what kind of file it is, not even which identities are inside. Only identities move: users, read state, preferences and caches stay local.

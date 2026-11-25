@@ -31,6 +31,10 @@ CONFIG_DEFAULTS: dict[str, Any] = {
 
 PREFERENCES_DEFAULTS: dict[str, Any] = {
     "version": 1,
+    "log": {
+        "default_filter": "-cat:bridges",  # what the event log's filter bar starts with
+        "saved_filters": [],  # [[name, query], ...]
+    },
     "layout": {
         "name": "three",  # three | two | stacked
         "boards_width": 32,  # columns
