@@ -124,6 +124,8 @@ The TUI shows unread counts on boards and an **Inbox** at the top of the board t
 | `scootaloo delete BOARD NUM [-y]` | delete your own post |
 | `scootaloo search QUERY [BOARD]` | search one board, or all |
 | `scootaloo verify BOARD NUM` | check the signatures behind an article |
+| `scootaloo report BOARD NUM --reason "…"` | report a post to its origin's moderators |
+| `scootaloo reports` | moderators: the report queue, with reasons |
 | `scootaloo unban BOARD NUM` | moderators: lift the punishments on a post's author |
 | `scootaloo close-board` / `reopen-board BOARD` | close a board to new posts, or reopen it |
 | `scootaloo mod ACTION BOARD NUM` | moderators: `pin`, `unpin`, `close`, `reopen`, `remove` a post; `warn` or `ban` its author (`--reason` required, `--days N`, or a permanent ban after a prompt) |
@@ -166,6 +168,8 @@ Threads open with the first post and its direct replies expanded; deeper replies
 | `v` | verify the focused post's signatures |
 | `/` | search this board (or all boards, from the inbox) |
 | `m` | mark this board (or the inbox) read |
+| `!` | report the focused post to the moderators |
+| `R` | switch between the Boards and Reports tabs. The Reports tab only appears when the relay says you may read its reports; `enter` on a report opens the reported post |
 | `M` | moderate the focused post: pin, close the thread, remove it, warn, ban or unban its author, close or reopen the board (moderators only) |
 | `r` | refresh everything |
 | `o` | connect to a relay |

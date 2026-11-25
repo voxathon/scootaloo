@@ -1345,3 +1345,68 @@ async def board_state(acct: Account, ref: BoardRef, close: bool, reason: str = "
             if e.code == 0x0009:
                 raise ScootalooError(f"{ref.label} is already {'closed' if close else 'open'}") from e
             raise
+
+
+# ---------------------------------------------------------------------------
+# Reports: anyone registered may file one; reading the queue needs REPORT_LIST
+# ---------------------------------------------------------------------------
+
+
+async def report(acct: Account, ref: BoardRef, num: int, reason: str, username: str | None = None) -> PublishResult:
+    """Report article #num (and its author) to the moderators of its origin."""
+    if not reason.strip():
+        raise ScootalooError("a report needs a reason: moderators read it")
+    sess = writable(acct, ref, username)
+    async with sess.writer() as c:
+        v = await c.get_article(ref.origin, ref.name, num, include_body=False)
+        try:
+            return await c.publish_report(
+                bytes.fromhex(v.author_pubkey), reason.strip(),
+                target_origin=ref.origin, target_board=ref.name, target_article_id=bytes.fromhex(v.article_id),
+            )
+        except ProtocolError as e:
+            if e.code == _DENIED:
+                raise ScootalooError(f"{ref.origin} doesn't let {sess.username} file reports") from e
+            raise
+
+
+@dataclass
+class Report:
+    info: object  # ReportInfo
+    reason: str
+    relay: str
+
+
+async def reports(acct: Account, relay: str | None = None, limit: int = 100) -> list[Report]:
+    """The moderation queue of a relay (newest first), with each report's reason."""
+    sess = Session.open(acct, relay)
+    async with sess.reader() as c:
+        try:
+            rows = await c.list_reports(b"", limit, 0)
+        except ProtocolError as e:
+            if e.code == _DENIED:
+                raise ScootalooError(f"only moderators can read {sess.origin}'s reports") from e
+            raise
+        out = []
+        for r in rows:
+            reason = ""
+            if r.body_size:
+                try:
+                    reason = (await c.get_event_body(r.origin, bytes.fromhex(r.event_id))).decode("utf-8", "replace")
+                except (ProtocolError, FirehoseClientError):
+                    reason = "(reason unavailable)"
+            out.append(Report(r, reason, sess.origin))
+    out.sort(key=lambda x: x.info.created_at, reverse=True)
+    return out
+
+
+async def can_read_reports(acct: Account, relay: str | None = None, board: str = "") -> bool:
+    """Ask the relay (PERMISSIONS) whether this user may read its report queue."""
+    try:
+        async with Session.open(acct, relay).reader() as c:
+            for scope in dict.fromkeys(("", board)):
+                if "REPORT_LIST" in (await c.get_permissions(scope)).commands:
+                    return True
+    except (ProtocolError, FirehoseClientError, OSError, ScootalooError):
+        return False
+    return False

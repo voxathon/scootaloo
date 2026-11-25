@@ -724,6 +724,33 @@ async def cmd_board_reopen(args):
     await cmd_board_state(args)
 
 
+async def cmd_report(args):
+    acct = account(args)
+    ref = await board_ref(args, acct)
+    reason = args.reason or (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
+    await core.report(acct, ref, args.num, reason, args.as_)
+    out.print(f"reported #{args.num} on {ref.label} to its moderators")
+
+
+async def cmd_reports(args):
+    acct = account(args)
+    rows = await core.reports(acct, args.relay, args.n)
+    if not rows:
+        out.print("[dim]no reports[/]")
+        return
+    t = Table(box=None, pad_edge=False)
+    t.add_column("when", style="dim")
+    t.add_column("by")
+    t.add_column("about")
+    t.add_column("where", style="cyan")
+    t.add_column("reason", overflow="fold")
+    for r in rows:
+        i = r.info
+        where = f"{i.target_board}@{i.target_origin}" if i.target_kind == "article" else i.target_kind
+        t.add_row(when(i.created_at), i.reporter_username or i.reporter_pubkey[:12], i.culprit_pubkey[:12], where, r.reason)
+    out.print(t)
+
+
 async def cmd_tail(args):
     acct = account(args)
     ref = await board_ref(args, acct)
@@ -894,6 +921,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--days", type=int, default=0, help="ban length; 0 = permanent (asks first)")
     p.add_argument("-y", "--yes", action="store_true", help="don't ask before a permanent ban")
     p.set_defaults(fn=cmd_mod)
+
+    p = sub.add_parser("report", help="report a post to its origin's moderators")
+    _board_args(p)
+    p.add_argument("num", type=int)
+    p.add_argument("--reason", help="what's wrong (else read from stdin)")
+    p.set_defaults(fn=cmd_report)
+    p = sub.add_parser("reports", help="moderators: the report queue of the active relay")
+    p.add_argument("-n", type=int, default=100)
+    p.set_defaults(fn=cmd_reports)
 
     p = sub.add_parser("unban", help="moderators: lift the punishments on a post's author")
     _board_args(p)

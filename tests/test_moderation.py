@@ -72,3 +72,38 @@ def test_owner_closes_and_reopens_own_board_and_unban_needs_a_punishment(post):
         run(core.board_state(mox, ref, False))
     with pytest.raises(core.ScootalooError, match="no punishments"):
         run(core.lift_punishments(mox, ref, num))
+
+
+def test_report_then_reports_tab(post):
+    import asyncio
+    from textual.widgets import Input, TabbedContent
+    from scootaloo.tui import Ask, ScootalooApp
+    from test_tui import settle, wait_screen
+
+    mox, ref, num = post
+    with pytest.raises(core.ScootalooError, match="needs a reason"):
+        run(core.report(mox, ref, num, "  "))
+    assert run(core.report(mox, ref, num, "spam, probably")).origin_seq > 0
+
+    async def go():
+        app = ScootalooApp(user="moxxie", password="hunter222")
+        async with app.run_test(size=(150, 45)) as pilot:
+            await settle(pilot, app)
+            app.open_thread(ref, num)
+            await settle(pilot, app)
+            await pilot.pause(0.3)
+            await pilot.press("exclamation_mark")
+            await wait_screen(pilot, app, Ask)
+            app.screen.query_one("#answer", Input).value = "filed from the TUI"
+            await pilot.press("enter")
+            await settle(pilot, app)
+            assert any("reported" in n.message for n in app._notifications)
+            # an ordinary user on a stock server can't read reports: no tab, and R does nothing
+            assert app.can_reports is False
+            assert app.query_one("#tabs", TabbedContent).get_tab("tab-reports").display is False
+            await pilot.press("R")
+            await settle(pilot, app)
+            assert app.query_one("#tabs", TabbedContent).active == "tab-boards"
+            assert not app.check_action("toggle_reports", ())
+
+    asyncio.run(go())

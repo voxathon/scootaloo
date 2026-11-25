@@ -20,6 +20,8 @@ from textual.widgets import (
     Label,
     Markdown,
     OptionList,
+    TabbedContent,
+    TabPane,
     Tree,
     Static,
     TextArea,
@@ -694,6 +696,11 @@ INBOX = "inbox"
 class ScootalooApp(App):
     TITLE = "scootaloo"
     CSS = """
+    #tabs { height: 1fr; }
+    #tabs ContentSwitcher { height: 1fr; }
+    #tabs TabPane { height: 1fr; padding: 0; }
+    #reports { height: 1fr; }
+    #reports-note { color: $text-muted; padding: 0 1; height: auto; }
     #panes { height: 1fr; }
     #boards { width: 32; height: 1fr; border-right: solid $primary-darken-2; }
     #threads { width: 1fr; height: 1fr; }
@@ -756,6 +763,8 @@ class ScootalooApp(App):
         Binding("g", "goto", "Go to #"),
         Binding("m", "mark_read", "Mark read"),
         Binding("M", "moderate", "Moderate"),
+        Binding("exclamation_mark", "report_post", "Report"),
+        Binding("R", "toggle_reports", "Reports"),
         Binding("z", "maximize_pane", "Maximize"),
         Binding("backslash", "cycle_layout", "Layout"),
         Binding("left_square_bracket", "resize(-1)", "Narrower", show=False),
@@ -802,11 +811,16 @@ class ScootalooApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical():
-            with Horizontal(id="panes"):
-                yield Tree("relays", id="boards")
-                yield DataTable(id="threads", cursor_type="row", zebra_stripes=True)
-                with VerticalScroll(id="view"):
-                    yield Static("pick a thread", id="empty")
+            with TabbedContent(id="tabs", initial="tab-boards"):
+                with TabPane("Boards", id="tab-boards"):
+                    with Horizontal(id="panes"):
+                        yield Tree("relays", id="boards")
+                        yield DataTable(id="threads", cursor_type="row", zebra_stripes=True)
+                        with VerticalScroll(id="view"):
+                            yield Static("pick a thread", id="empty")
+                with TabPane("Reports", id="tab-reports"):
+                    yield Static("", id="reports-note")
+                    yield DataTable(id="reports", cursor_type="row", zebra_stripes=True)
             yield Static("", id="status")
         yield Footer()
 
@@ -821,6 +835,15 @@ class ScootalooApp(App):
         t.add_column("subject", key="subject", width=28)
         t.add_column("author", key="author", width=14)
         t.add_column("date", key="when", width=5)
+        rt = self.query_one("#reports", DataTable)
+        rt.add_column("when", width=11)
+        rt.add_column("by", width=14)
+        rt.add_column("about", width=14)
+        rt.add_column("where", width=24)
+        rt.add_column("reason")
+        self.report_rows: dict[str, object] = {}
+        self.can_reports = False
+        self.query_one("#tabs", TabbedContent).hide_tab("tab-reports")  # shown once the relay says we may
         self.start()
         self.set_interval(self.REFRESH_SECONDS, self._tick)
 
@@ -828,7 +851,25 @@ class ScootalooApp(App):
         """Until someone is logged in, only quitting makes sense (and only it shows in the footer)."""
         if isinstance(self.screen, Login) and action != "quit":
             return False
+        if action == "toggle_reports" and not self.can_reports:
+            return False  # not a moderator here: no Reports tab, no key for it
         return True
+
+    @work(exclusive=True, group="report-access")
+    async def refresh_report_access(self) -> None:
+        relay = self.ref.via if self.ref else (core.active_relay(self.acct) or {}).get("origin") if self.acct else None
+        allowed = bool(relay) and await core.can_read_reports(self.acct, relay, self.ref.name if self.ref else "")
+        if allowed == self.can_reports:
+            return
+        self.can_reports = allowed
+        tabs = self.query_one("#tabs", TabbedContent)
+        if allowed:
+            tabs.show_tab("tab-reports")
+        else:
+            if tabs.active == "tab-reports":
+                tabs.active = "tab-boards"
+            tabs.hide_tab("tab-reports")
+        self.refresh_bindings()
 
     @property
     def target_ref(self) -> core.BoardRef | None:
@@ -1139,6 +1180,7 @@ class ScootalooApp(App):
                 if ref.is_home and not ref.name.startswith("~") and (first is None or ref.name == "general"):
                     first = leaf
         self._relabel()
+        self.refresh_report_access()
         tree.focus()
         if self.ref and self.ref in self.nodes:
             first = self.nodes[self.ref]
@@ -1805,6 +1847,74 @@ class ScootalooApp(App):
         if r:
             self.notify(f"{action}: #{v.article_num} done")
             await self._after_write(ref, self.thread.root.article_num if self.thread else v.article_num, None)
+
+    # -- reports ---------------------------------------------------------------
+
+    def action_toggle_reports(self) -> None:
+        tabs = self.query_one("#tabs", TabbedContent)
+        tabs.active = "tab-boards" if tabs.active == "tab-reports" else "tab-reports"
+        if tabs.active == "tab-reports":
+            self.query_one("#reports", DataTable).focus()
+
+    @on(TabbedContent.TabActivated, "#tabs")
+    def tab_activated(self, ev: TabbedContent.TabActivated) -> None:
+        if ev.pane.id == "tab-reports" and self.acct:
+            self.load_reports()
+
+    @work(exclusive=True, group="reports")
+    async def load_reports(self) -> None:
+        note, rt = self.query_one("#reports-note", Static), self.query_one("#reports", DataTable)
+        relay = self.ref.via if self.ref else (core.active_relay(self.acct) or {}).get("origin")
+        note.update(f"loading reports from {relay}…")
+        try:
+            rows = await core.reports(self.acct, relay)
+        except core.ScootalooError as e:
+            note.update(str(e))
+            rt.clear()
+            return
+        except Exception as e:  # noqa: BLE001
+            note.update(f"couldn't load reports: {e}")
+            return
+        rt.clear()
+        self.report_rows = {}
+        for k, r in enumerate(rows):
+            i = r.info
+            where = f"{i.target_board}@{i.target_origin}" if i.target_kind == "article" else i.target_kind
+            rt.add_row(datetime.fromtimestamp(i.created_at).strftime("%m-%d %H:%M"),
+                       i.reporter_username or i.reporter_pubkey[:12], i.culprit_pubkey[:12], where,
+                       r.reason.replace("\n", " ")[:200], key=f"r{k}")
+            self.report_rows[f"r{k}"] = r
+        note.update(f"{len(rows)} report{'s' if len(rows) != 1 else ''} on {relay} · enter opens the reported post · M on it to act")
+
+    @on(DataTable.RowSelected, "#reports")
+    def report_selected(self, ev: DataTable.RowSelected) -> None:
+        r = self.report_rows.get(ev.row_key.value)
+        if r is None or r.info.target_kind != "article":
+            self.notify("this report doesn't point at a post", severity="warning")
+            return
+        self.run_worker(self._open_reported(r))
+
+    async def _open_reported(self, r) -> None:
+        i = r.info
+        ref = next((b for b in self.refs if b.origin == i.target_origin and b.name == i.target_board),
+                   core.BoardRef(i.target_origin, i.target_board, r.relay))
+        num = await self._guard(core.num_for_id(self.acct, ref, i.target_article_id))
+        if num is None:
+            return
+        self.query_one("#tabs", TabbedContent).active = "tab-boards"
+        self.open_thread(ref, num, focus_num=num)
+
+    @work
+    async def action_report_post(self) -> None:
+        item, ref = self._focused_item(), self._item_ref()
+        if not item or not ref:
+            self.notify("open a thread and focus a post first", severity="warning")
+            return
+        reason = await self.push_screen_wait(Ask(f"report #{item.view.article_num}: what's wrong? (moderators read this)"))
+        if not reason:
+            return
+        if await self._guard(core.report(self.acct, ref, item.view.article_num, reason)):
+            self.notify(f"reported #{item.view.article_num}")
 
     def action_mark_read(self) -> None:
         if self.mode == "board" and self.ref:
