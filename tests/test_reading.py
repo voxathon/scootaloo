@@ -320,3 +320,41 @@ def test_layout_maximize_resize_persist_and_help(deep):
             assert app.query_one("#panes").has_class("-show-boards")
 
     asyncio.run(go())
+
+
+def test_enter_from_preview_keeps_the_thread(deep):
+    """Regression: opening a thread re-renders the list, which must not re-trigger a preview."""
+    mox, ref, n = deep
+    run(core.post(mox, ref, "another thread", "so the list has two rows"))
+
+    async def go():
+        app = ScootalooApp(user="moxxie", password="hunter222")
+        async with app.run_test(size=(160, 50)) as pilot:
+            await settle(pilot, app)
+            app.open_board(ref)
+            await settle(pilot, app)
+            t = app.query_one("#threads", DataTable)
+            t.focus()
+            await pilot.pause(0.5)
+            await pilot.press("down")  # skim to the older thread (the OP with replies)
+            await pilot.pause(0.5)
+            await settle(pilot, app)
+            assert app.previewing == (ref, n["op"])
+            hint = str(app.query_one("#preview-hint").render())
+            assert "4 replies" in hint and "ENTER" in hint
+
+            await pilot.press("enter")
+            await settle(pilot, app)
+            await pilot.pause(0.6)  # longer than the preview delay
+            await settle(pilot, app)
+            assert app.previewing is None and app.thread is not None
+            assert len(app.posts) == 5 and isinstance(app.focused, Post)
+
+            # back to the list and down again: previews resume
+            await pilot.press("escape")
+            await pilot.press("up")
+            await pilot.pause(0.5)
+            await settle(pilot, app)
+            assert app.previewing is not None and app.previewing[1] != n["op"]
+
+    asyncio.run(go())

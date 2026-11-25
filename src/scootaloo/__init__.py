@@ -1,6 +1,6 @@
 """scootaloo: a terminal client for Bonnet."""
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 
 def main() -> int:

@@ -536,7 +536,8 @@ class ScootalooApp(App):
     #panes.-show-boards #boards { display: block; }
     .post-body { height: auto; }
     .more { height: auto; margin-top: 0; }
-    #preview-label { color: $text-muted; padding: 0 1; }
+    #preview-label { margin: 0 0 1 0; }
+    #preview-hint { margin: 1 0 0 2; }
     #links { height: auto; max-height: 20; margin: 1 0; }
     #url { margin: 1 0; }
     #info-actions { height: auto; margin-top: 1; }
@@ -615,6 +616,7 @@ class ScootalooApp(App):
         self.thread_cache: dict[tuple[core.BoardRef, int], tuple[int | None, core.Thread]] = {}
         self.previewing: tuple[core.BoardRef, int] | None = None
         self._preview_timer = None
+        self._last_highlight: tuple[core.BoardRef, int] | None = None
         self.layout_name = "three"
         self.boards_width = 32
         self.list_share = 50  # percent of the width (or height, stacked) the thread list gets
@@ -940,6 +942,7 @@ class ScootalooApp(App):
     def thread_selected(self, ev: DataTable.RowSelected) -> None:
         self._cancel_preview()
         ref, num = self.rowmap[ev.row_key.value]
+        self._last_highlight = (ref, num)
         self.open_thread(ref, num)
 
     async def _clear_view(self, msg: str) -> None:
@@ -1266,8 +1269,11 @@ class ScootalooApp(App):
             return
         if self.focused is not self.query_one("#threads", DataTable):
             return  # only skim when you're the one moving through the list
-        self._cancel_preview()
         ref, num = self.rowmap[ev.row_key.value]
+        if self._last_highlight == (ref, num):
+            return  # the list was re-rendered under the same row (e.g. after opening a thread): not a move
+        self._last_highlight = (ref, num)
+        self._cancel_preview()
         self._preview_timer = self.set_timer(0.15, lambda: self.show_preview(ref, num))
 
     def on_descendant_focus(self, event) -> None:
@@ -1278,6 +1284,7 @@ class ScootalooApp(App):
             if key in self.rowmap:
                 self._cancel_preview()
                 ref, num = self.rowmap[key]
+                self._last_highlight = (ref, num)
                 self._preview_timer = self.set_timer(0.15, lambda: self.show_preview(ref, num))
 
     @work(exclusive=True, group="view")
@@ -1290,11 +1297,20 @@ class ScootalooApp(App):
             item = await self._guard(core.article(self.acct, ref, num))
             if item is None:
                 return
+        if self.thread is not None and self.previewing is None and self.focused is not self.query_one("#threads", DataTable):
+            return  # a thread was opened meanwhile; don't cover it
+        root_id = item.view.article_id
+        replies = sum(1 for r in self.index.rows(ref) if r.root_article_id == root_id)
         view = self.query_one("#view", VerticalScroll)
         await view.remove_children()
         self.thread, self.previewing = None, (ref, num)
-        await view.mount(Static(Text("preview · enter opens the thread", style="dim italic"), id="preview-label"))
+        await view.mount(Static(Text(" PREVIEW ", style="bold reverse"), id="preview-label"))
         await view.mount(Post(item, 0))
+        if replies:
+            hint = f"… {replies} repl{'y' if replies == 1 else 'ies'} · press ENTER to read the thread …"
+        else:
+            hint = "… no replies yet · press ENTER to open the thread …"
+        await view.mount(Static(Text(hint, style="bold cyan"), id="preview-hint"))
         view.scroll_home(animate=False)
         self.set_status()
 
