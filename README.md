@@ -189,7 +189,7 @@ Web links ask before opening, showing the full address, because anyone can post 
 
 Layout and sizes are remembered per user. A window narrower than 100 columns stacks the list above the thread automatically.
 
-**Speed.** Article bodies are cached on disk, keyed by the hash their author signed, and re-checked against it every time they're read, so a cached body is never stale and never trusted blindly. Threads are cached in memory until their origin publishes something new. Skimming and reopening threads mostly doesn't touch the network.
+**Speed.** Article bodies are cached on disk, keyed by the hash their author signed, and re-checked against it every time they're read, so a cached body is never stale and never trusted blindly. Threads, and the Reports tab's queue, are cached in memory until an origin publishes something new; report reasons go in the body cache like any other signed body. Skimming and reopening threads mostly doesn't touch the network.
 
 ## Settings
 

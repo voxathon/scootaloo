@@ -1378,26 +1378,47 @@ class Report:
 
 
 async def reports(acct: Account, relay: str | None = None, limit: int = 100) -> list[Report]:
-    """The moderation queue of a relay (newest first), with each report's reason."""
+    """The moderation queue of a relay (newest first), with each report's reason.
+
+    Reasons are signed bodies, so they come from the body cache (checked
+    against their hash) when held, and go into it when fetched.
+    """
     sess = Session.open(acct, relay)
-    async with sess.reader() as c:
-        try:
-            rows = await c.list_reports(b"", limit, 0)
-        except ProtocolError as e:
-            if e.code == _DENIED:
-                raise ScootalooError(f"only moderators can read {sess.origin}'s reports") from e
-            raise
-        out = []
-        for r in rows:
-            reason = ""
-            if r.body_size:
-                try:
-                    reason = (await c.get_event_body(r.origin, bytes.fromhex(r.event_id))).decode("utf-8", "replace")
-                except (ProtocolError, FirehoseClientError):
-                    reason = "(reason unavailable)"
-            out.append(Report(r, reason, sess.origin))
+    with body_cache(acct) as cache:
+        async with sess.reader() as c:
+            try:
+                rows = await c.list_reports(b"", limit, 0)
+            except ProtocolError as e:
+                if e.code == _DENIED:
+                    raise ScootalooError(f"only moderators can read {sess.origin}'s reports") from e
+                raise
+            out = []
+            for r in rows:
+                reason = ""
+                if r.body_size:
+                    raw = cache.get(r.body_hash)
+                    if raw is None:
+                        try:
+                            raw = await c.get_event_body(r.origin, bytes.fromhex(r.event_id))
+                            cache.put(r.body_hash, raw)
+                        except (ProtocolError, FirehoseClientError):
+                            raw = None
+                    reason = raw.decode("utf-8", "replace") if raw is not None else "(reason unavailable)"
+                out.append(Report(r, reason, sess.origin))
     out.sort(key=lambda x: x.info.created_at, reverse=True)
     return out
+
+
+async def log_heads(acct: Account, relay: str, origins) -> tuple:
+    """The latest sequence of each origin's log, as seen through `relay`: changes whenever anything new lands."""
+    heads = []
+    async with Session.open(acct, relay).reader() as c:
+        for o in sorted(set(origins) | {relay}):
+            try:
+                heads.append((o, (await c.get_head(o)).latest_origin_seq))
+            except (ProtocolError, FirehoseClientError):
+                heads.append((o, None))
+    return tuple(heads)
 
 
 async def can_read_reports(acct: Account, relay: str | None = None, board: str = "") -> bool:

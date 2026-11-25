@@ -842,6 +842,7 @@ class ScootalooApp(App):
         rt.add_column("where", width=24)
         rt.add_column("reason")
         self.report_rows: dict[str, object] = {}
+        self.report_cache: dict[str, tuple] = {}  # relay -> (log heads when fetched, rows)
         self.can_reports = False
         self.query_one("#tabs", TabbedContent).hide_tab("tab-reports")  # shown once the relay says we may
         self.start()
@@ -920,6 +921,7 @@ class ScootalooApp(App):
         self.acct, self.ref, self.thread, self.mode = acct, None, None, "board"
         self.index = core.Index()
         self.thread_cache = {}
+        self.report_cache = {}  # never carry one user's moderation view over to the next
         self.previewing = None
         self._load_layout()
         self.query_one("#threads", DataTable).clear()
@@ -1467,6 +1469,9 @@ class ScootalooApp(App):
     def action_refresh(self) -> None:
         if not self.acct:
             return
+        if self.query_one("#tabs", TabbedContent).active == "tab-reports":
+            self.load_reports(force=True)
+            return
 
         async def full():
             await self.load_boards()
@@ -1484,6 +1489,8 @@ class ScootalooApp(App):
         self._busy = True
         try:
             before = sum(len(v) for v in self.unread_map.values())
+            if self.can_reports and self.query_one("#tabs", TabbedContent).active == "tab-reports":
+                self.load_reports()
             changed = await self.index.refresh(self.acct, self.refs)
             if not changed:
                 return
@@ -1861,20 +1868,12 @@ class ScootalooApp(App):
         if ev.pane.id == "tab-reports" and self.acct:
             self.load_reports()
 
-    @work(exclusive=True, group="reports")
-    async def load_reports(self) -> None:
-        note, rt = self.query_one("#reports-note", Static), self.query_one("#reports", DataTable)
-        relay = self.ref.via if self.ref else (core.active_relay(self.acct) or {}).get("origin")
-        note.update(f"loading reports from {relay}…")
-        try:
-            rows = await core.reports(self.acct, relay)
-        except core.ScootalooError as e:
-            note.update(str(e))
-            rt.clear()
-            return
-        except Exception as e:  # noqa: BLE001
-            note.update(f"couldn't load reports: {e}")
-            return
+    def _reports_relay(self) -> str | None:
+        return self.ref.via if self.ref else (core.active_relay(self.acct) or {}).get("origin")
+
+    def _render_reports(self, relay: str, rows, note_extra: str = "") -> None:
+        rt = self.query_one("#reports", DataTable)
+        cursor = rt.cursor_row
         rt.clear()
         self.report_rows = {}
         for k, r in enumerate(rows):
@@ -1884,7 +1883,43 @@ class ScootalooApp(App):
                        i.reporter_username or i.reporter_pubkey[:12], i.culprit_pubkey[:12], where,
                        r.reason.replace("\n", " ")[:200], key=f"r{k}")
             self.report_rows[f"r{k}"] = r
-        note.update(f"{len(rows)} report{'s' if len(rows) != 1 else ''} on {relay} · enter opens the reported post · M on it to act")
+        if rt.row_count:
+            rt.move_cursor(row=min(cursor, rt.row_count - 1), animate=False)
+        self.query_one("#reports-note", Static).update(
+            f"{len(rows)} report{'s' if len(rows) != 1 else ''} on {relay} · enter opens the reported post · M on it to act"
+            + note_extra
+        )
+
+    @work(exclusive=True, group="reports")
+    async def load_reports(self, force: bool = False) -> None:
+        """Show the cached queue at once; refetch only when an origin's log has moved since."""
+        note = self.query_one("#reports-note", Static)
+        relay = self._reports_relay()
+        if not relay:
+            return
+        cached = self.report_cache.get(relay)
+        if cached:
+            self._render_reports(relay, cached[1], " · checking for new…")
+        else:
+            note.update(f"loading reports from {relay}…")
+        try:
+            origins = {b.origin for b in self.refs if b.via == relay}
+            heads = await core.log_heads(self.acct, relay, origins)
+            if cached and not force and cached[0] == heads:
+                self._render_reports(relay, cached[1])
+                return
+            rows = await core.reports(self.acct, relay)
+        except core.ScootalooError as e:
+            note.update(str(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            note.update(f"couldn't load reports: {e}" + (" (showing the last copy)" if cached else ""))
+            return
+        new = len(rows) - len(cached[1]) if cached else 0
+        self.report_cache[relay] = (heads, rows)
+        self._render_reports(relay, rows)
+        if new > 0:
+            self.notify(f"{new} new report{'s' if new != 1 else ''}")
 
     @on(DataTable.RowSelected, "#reports")
     def report_selected(self, ev: DataTable.RowSelected) -> None:

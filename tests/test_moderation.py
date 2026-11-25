@@ -107,3 +107,52 @@ def test_report_then_reports_tab(post):
             assert not app.check_action("toggle_reports", ())
 
     asyncio.run(go())
+
+
+def test_reports_tab_is_cached_until_a_log_moves(post, monkeypatch):
+    """Stand-in queue (the test servers have no moderators): count real fetches."""
+    import asyncio
+    from types import SimpleNamespace
+    from textual.widgets import DataTable, TabbedContent
+    from scootaloo.tui import ScootalooApp
+    from test_tui import settle
+
+    mox, ref, num = post
+    calls = []
+
+    async def fake_reports(acct, relay=None, limit=100):
+        calls.append(relay)
+        info = SimpleNamespace(created_at=1, reporter_username="pinkie", reporter_pubkey="ab" * 32,
+                               culprit_pubkey="cd" * 32, target_kind="article", target_origin=ref.origin,
+                               target_board=ref.name, target_article_id="00" * 32)
+        return [core.Report(info, f"report #{len(calls)}", relay)]
+
+    async def yes(*a, **k):
+        return True
+
+    monkeypatch.setattr(core, "reports", fake_reports)
+    monkeypatch.setattr(core, "can_read_reports", yes)
+
+    async def go():
+        app = ScootalooApp(user="moxxie", password="hunter222")
+        async with app.run_test(size=(150, 45)) as pilot:
+            await settle(pilot, app)
+            await settle(pilot, app)
+            assert app.can_reports
+            await pilot.press("R")
+            await settle(pilot, app)
+            rt = app.query_one("#reports", DataTable)
+            assert len(calls) == 1 and rt.row_count == 1
+            await pilot.press("R", "R")  # away and back: served from the cache
+            await settle(pilot, app)
+            assert len(calls) == 1 and rt.row_count == 1
+            await core.post(mox, ref, "something new", "x")  # a log moved
+            app.load_reports()
+            await settle(pilot, app)
+            assert len(calls) == 2
+            await pilot.press("r")  # refresh on the tab forces a fetch
+            await settle(pilot, app)
+            assert len(calls) == 3
+            assert app.query_one("#tabs", TabbedContent).active == "tab-reports"
+
+    asyncio.run(go())
