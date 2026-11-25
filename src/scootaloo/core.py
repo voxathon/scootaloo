@@ -14,6 +14,7 @@ Three ideas carry the rest:
 from __future__ import annotations
 
 import os
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1256,3 +1257,91 @@ def write_archive(path: str, data: bytes, overwrite: bool = False) -> str:
         f.write(data)
     os.replace(tmp, path)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Moderation (needs a moderator or admin role on the board's origin)
+# ---------------------------------------------------------------------------
+
+MOD_ACTIONS = ("pin", "unpin", "close", "reopen", "remove", "warn", "ban")
+
+
+async def moderate(acct: Account, ref: BoardRef, num: int, action: str, reason: str = "",
+                   rank: int = 0, days: int = 0, username: str | None = None) -> PublishResult:
+    """A moderator action on article #num, or (warn/ban) on its author."""
+    if action not in MOD_ACTIONS:
+        raise ScootalooError(f"unknown action '{action}'")
+    sess = writable(acct, ref, username)
+    async with sess.writer() as c:
+        try:
+            v = await c.get_article(ref.origin, ref.name, num, include_body=False)
+        except ProtocolError as e:
+            if e.code == _MISSING:
+                raise ScootalooError(f"no article #{num} in {ref.label}") from e
+            raise
+        aid = bytes.fromhex(v.article_id)
+        try:
+            if action == "pin":
+                return await c.publish_pin("", ref.origin, ref.name, aid, rank)
+            if action == "unpin":
+                return await c.publish_unpin("", ref.origin, ref.name, aid)
+            if action == "close":
+                return await c.publish_thread_close("", ref.origin, ref.name, aid, reason)
+            if action == "reopen":
+                return await c.publish_thread_reopen("", ref.origin, ref.name, aid, reason)
+            if action == "remove":
+                return await c.publish_cancel("", ref.origin, ref.name, aid, reason)
+            if not reason.strip():
+                raise ScootalooError(f"a {action} needs a reason (--reason); the punished user sees it")
+            key = bytes.fromhex(v.author_pubkey)
+            if action == "warn":
+                return await c.publish_punishment_warn(key, reason, board=ref.name)
+            if days <= 0:
+                return await c.publish_punishment_permaban(key, reason, board=ref.name)
+            return await c.publish_punishment_ban(key, reason, int(time.time()) + days * 86400, board=ref.name)
+        except ProtocolError as e:
+            if e.code == _DENIED:
+                raise ScootalooError(f"{ref.origin} refused: {sess.username} isn't a moderator for {ref.label}") from e
+            if e.code == 0x0009:
+                raise ScootalooError(f"nothing to do: {e.detail or e}") from e
+            raise
+
+
+async def lift_punishments(acct: Account, ref: BoardRef, num: int, reason: str = "",
+                           username: str | None = None) -> int:
+    """Revoke every active punishment of article #num's author issued on its origin. Returns how many."""
+    sess = writable(acct, ref, username)
+    async with sess.writer() as c:
+        v = await c.get_article(ref.origin, ref.name, num, include_body=False)
+        status = await c.get_ban_status(bytes.fromhex(v.author_pubkey))
+        mine = [p for p in status.punishments if p.origin == ref.origin and p.event_id]
+        if not mine:
+            raise ScootalooError(f"{core_label(v)} has no punishments from {ref.origin}")
+        try:
+            for p in mine:
+                await c.publish_punishment_revoke(bytes.fromhex(p.event_id), reason)
+        except ProtocolError as e:
+            if e.code == _DENIED:
+                raise ScootalooError(f"{ref.origin} refused: {sess.username} isn't a moderator there") from e
+            raise
+        return len(mine)
+
+
+def core_label(v) -> str:
+    return author_label(v)
+
+
+async def board_state(acct: Account, ref: BoardRef, close: bool, reason: str = "", username: str | None = None) -> PublishResult:
+    """Close (no new posts) or reopen a whole board."""
+    sess = writable(acct, ref, username)
+    async with sess.writer() as c:
+        try:
+            if close:
+                return await c.publish_board_close(ref.name, reason)
+            return await c.publish_board_reopen(ref.name, reason)
+        except ProtocolError as e:
+            if e.code == _DENIED:
+                raise ScootalooError(f"{ref.origin} refused: {sess.username} can't close or reopen {ref.label}") from e
+            if e.code == 0x0009:
+                raise ScootalooError(f"{ref.label} is already {'closed' if close else 'open'}") from e
+            raise

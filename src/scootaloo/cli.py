@@ -691,6 +691,39 @@ async def cmd_identity_import(args):
             out.print(f"    [dim]{note}[/]")
 
 
+async def cmd_mod(args):
+    acct = account(args)
+    ref = await board_ref(args, acct)
+    if args.action == "ban" and args.days <= 0 and not args.yes:
+        if not sys.stdin.isatty() or not Confirm.ask("no --days: that's a PERMANENT ban. Go ahead?", default=False, console=err):
+            raise core.ScootalooError("not banned (pass --days N for a temporary ban)")
+    r = await core.moderate(acct, ref, args.num, args.action, args.reason or "", args.rank, args.days, args.as_)
+    out.print(f"{args.action}: #{args.num} on {ref.label} (seq {r.origin_seq})")
+
+
+async def cmd_unban(args):
+    acct = account(args)
+    ref = await board_ref(args, acct)
+    n = await core.lift_punishments(acct, ref, args.num, args.reason or "", args.as_)
+    out.print(f"lifted {n} punishment{'s' if n != 1 else ''} from the author of #{args.num}")
+
+
+async def cmd_board_state(args):
+    acct = account(args)
+    ref = await board_ref(args, acct)
+    close = args.fn is cmd_board_close
+    await core.board_state(acct, ref, close, args.reason or "", args.as_)
+    out.print(f"{ref.label} is now {'closed' if close else 'open'}")
+
+
+async def cmd_board_close(args):
+    await cmd_board_state(args)
+
+
+async def cmd_board_reopen(args):
+    await cmd_board_state(args)
+
+
 async def cmd_tail(args):
     acct = account(args)
     ref = await board_ref(args, acct)
@@ -851,6 +884,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--url", help="with --manual: the relay URL (default https://ORIGIN)")
     p.add_argument("-y", "--yes", action="store_true", help="don't ask before replacing")
     p.set_defaults(fn=cmd_identity_import)
+
+    p = sub.add_parser("mod", help="moderator actions: pin, unpin, close, reopen, remove a post; warn or ban its author")
+    p.add_argument("action", choices=core.MOD_ACTIONS)
+    _board_args(p)
+    p.add_argument("num", type=int)
+    p.add_argument("--reason", help="why (required for warn and ban; shown to the user)")
+    p.add_argument("--rank", type=int, default=0, help="pin order")
+    p.add_argument("--days", type=int, default=0, help="ban length; 0 = permanent (asks first)")
+    p.add_argument("-y", "--yes", action="store_true", help="don't ask before a permanent ban")
+    p.set_defaults(fn=cmd_mod)
+
+    p = sub.add_parser("unban", help="moderators: lift the punishments on a post's author")
+    _board_args(p)
+    p.add_argument("num", type=int)
+    p.add_argument("--reason")
+    p.set_defaults(fn=cmd_unban)
+    for verb, fn, what in (("close-board", cmd_board_close, "close a board to new posts"),
+                           ("reopen-board", cmd_board_reopen, "reopen a closed board")):
+        p = sub.add_parser(verb, help=f"board owners and moderators: {what}")
+        _board_args(p)
+        p.add_argument("--reason")
+        p.set_defaults(fn=fn)
 
     sub.add_parser("unread", help="boards with unread posts").set_defaults(fn=cmd_unread)
 

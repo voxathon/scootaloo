@@ -645,6 +645,45 @@ class Identities(ModalScreen[tuple | None]):
         self.dismiss(None)
 
 
+class ModMenu(ModalScreen[str | None]):
+    """Moderator actions for one post. Returns the action name."""
+
+    BINDINGS = [Binding("escape", "close", "Close")]
+    LABELS = [
+        ("pin", "Pin this post"), ("unpin", "Unpin it"),
+        ("close", "Close the thread (no more replies)"), ("reopen", "Reopen the thread"),
+        ("remove", "Remove this post"), ("warn", "Warn its author"), ("ban", "Ban its author"),
+        ("unban", "Lift its author's punishments"),
+        ("close-board", "Close this whole board"), ("reopen-board", "Reopen this board"),
+    ]
+
+    def __init__(self, item: core.ThreadItem):
+        super().__init__()
+        self.item = item
+
+    def compose(self) -> ComposeResult:
+        v = self.item.view
+        with Vertical(classes="dialog"):
+            yield Label(Text(f"Moderate #{v.article_num} by {core.author_label(v)}", style="bold"))
+            ol = OptionList(id="mod-list")
+            for key, label in self.LABELS:
+                ol.add_option(Option(label, id=key))
+            yield ol
+            yield Label(Text("needs a moderator or admin role on this board's origin", style="dim"))
+
+    def on_mount(self) -> None:
+        ol = self.query_one("#mod-list", OptionList)
+        ol.highlighted = 0
+        ol.focus()
+
+    @on(OptionList.OptionSelected, "#mod-list")
+    def picked(self, ev: OptionList.OptionSelected) -> None:
+        self.dismiss(ev.option.id)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 # ---------------------------------------------------------------------------
 # app
 # ---------------------------------------------------------------------------
@@ -672,7 +711,8 @@ class ScootalooApp(App):
     #links { height: auto; max-height: 20; margin: 1 0; }
     #url { margin: 1 0; }
     #info-actions { height: auto; margin-top: 1; }
-    LinkPicker, OpenLink, Info, Identities { align: center middle; }
+    LinkPicker, OpenLink, Info, Identities, ModMenu { align: center middle; }
+    #mod-list { height: auto; margin: 1 0; }
     #id-list { height: auto; max-height: 24; margin: 1 0; }
     #status { height: 1; background: $boost; color: $text-muted; padding: 0 1; }
     .post { height: auto; margin: 0 0 1 0; padding: 0 1; border-left: tall $primary; }
@@ -715,6 +755,7 @@ class ScootalooApp(App):
         Binding("v", "verify", "Verify"),
         Binding("g", "goto", "Go to #"),
         Binding("m", "mark_read", "Mark read"),
+        Binding("M", "moderate", "Moderate"),
         Binding("z", "maximize_pane", "Maximize"),
         Binding("backslash", "cycle_layout", "Layout"),
         Binding("left_square_bracket", "resize(-1)", "Narrower", show=False),
@@ -1716,6 +1757,54 @@ class ScootalooApp(App):
             from scootaloo.cli import verification_markup
 
             await self.push_screen_wait(Show(verification_markup(v)))
+
+    @work
+    async def action_moderate(self) -> None:
+        item, ref = self._focused_item(), self._item_ref()
+        if not item or not ref:
+            self.notify("open a thread and focus a post first", severity="warning")
+            return
+        action = await self.push_screen_wait(ModMenu(item))
+        if not action:
+            return
+        v = item.view
+        reason, days = "", 0
+        if action in ("warn", "ban", "remove", "close", "unban", "close-board", "reopen-board"):
+            optional = action != "warn" and action != "ban"
+            reason = await self.push_screen_wait(Ask(f"reason for the {action}" + (" (optional)" if optional else " (the user sees it)")))
+            if reason is None and not optional:
+                return
+            reason = reason or ""
+        if action == "ban":
+            answer = await self.push_screen_wait(Ask("ban for how many days? (0 = permanent)", "7"))
+            if answer is None:
+                return
+            try:
+                days = int(answer)
+            except ValueError:
+                self.notify(f"{answer!r} isn't a number of days", severity="warning")
+                return
+        if action in ("remove", "ban"):
+            what = (f"Remove #{v.article_num} \u201c{v.subject}\u201d?" if action == "remove" else
+                    f"Ban {core.author_label(v)} " + (f"for {days} day{'s' if days != 1 else ''}?" if days > 0 else "PERMANENTLY?"))
+            if not await self.push_screen_wait(YesNo(what)):
+                return
+        if action == "unban":
+            n = await self._guard(core.lift_punishments(self.acct, ref, v.article_num, reason))
+            if n:
+                self.notify(f"lifted {n} punishment{'s' if n != 1 else ''}")
+            return
+        if action in ("close-board", "reopen-board"):
+            if action == "close-board" and not await self.push_screen_wait(YesNo(f"Close {ref.label} to new posts?")):
+                return
+            if await self._guard(core.board_state(self.acct, ref, action == "close-board", reason)):
+                self.notify(f"{ref.label} {'closed' if action == 'close-board' else 'reopened'}")
+                await self.load_boards()
+            return
+        r = await self._guard(core.moderate(self.acct, ref, v.article_num, action, reason, days=days))
+        if r:
+            self.notify(f"{action}: #{v.article_num} done")
+            await self._after_write(ref, self.thread.root.article_num if self.thread else v.article_num, None)
 
     def action_mark_read(self) -> None:
         if self.mode == "board" and self.ref:

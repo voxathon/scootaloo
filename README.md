@@ -124,6 +124,9 @@ The TUI shows unread counts on boards and an **Inbox** at the top of the board t
 | `scootaloo delete BOARD NUM [-y]` | delete your own post |
 | `scootaloo search QUERY [BOARD]` | search one board, or all |
 | `scootaloo verify BOARD NUM` | check the signatures behind an article |
+| `scootaloo unban BOARD NUM` | moderators: lift the punishments on a post's author |
+| `scootaloo close-board` / `reopen-board BOARD` | close a board to new posts, or reopen it |
+| `scootaloo mod ACTION BOARD NUM` | moderators: `pin`, `unpin`, `close`, `reopen`, `remove` a post; `warn` or `ban` its author (`--reason` required, `--days N`, or a permanent ban after a prompt) |
 | `scootaloo tui` | the full-screen client (same as plain `scootaloo`) |
 
 `post` and `reply` take the body from `-m TEXT`, then `-f FILE`, then stdin if something is piped in, and otherwise open `$EDITOR` (Notepad on Windows). Bodies are sent as `text/markdown` unless you pass `--content-type`.
@@ -163,6 +166,7 @@ Threads open with the first post and its direct replies expanded; deeper replies
 | `v` | verify the focused post's signatures |
 | `/` | search this board (or all boards, from the inbox) |
 | `m` | mark this board (or the inbox) read |
+| `M` | moderate the focused post: pin, close the thread, remove it, warn, ban or unban its author, close or reopen the board (moderators only) |
 | `r` | refresh everything |
 | `o` | connect to a relay |
 | `i` | identities: post as, register, export, import |
