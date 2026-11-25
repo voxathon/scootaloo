@@ -25,7 +25,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from scootaloo import core
+from scootaloo import core, links
 from scootaloo.accounts import Account, AccountError, Stores, Users, default_user
 
 
@@ -147,31 +147,92 @@ class TrustKey(ModalScreen[bool]):
 # ---------------------------------------------------------------------------
 
 
-class Post(Vertical, can_focus=True):
-    """One article in the open thread. Focus one and press c to reply to it."""
+SHOW_LINES = 12  # a longer body is cut here, with "show more"
+OPEN_DEPTH = 1  # the OP (0) and its direct replies (1) start open; deeper replies start collapsed
 
-    def __init__(self, item: core.ThreadItem):
+
+class Post(Vertical, can_focus=True):
+    """One article in the open thread.
+
+    Collapsed: just its header, with its replies hidden too. Long bodies show
+    SHOW_LINES lines until you ask for more. Arrow keys walk the thread;
+    the app's keys (reply, edit, info, links…) act on whichever post has focus.
+    """
+
+    BINDINGS = [
+        Binding("down", "app.next_post", "Next post", show=False),
+        Binding("up", "app.prev_post", "Previous post", show=False),
+        Binding("right", "app.expand_post", "Expand", show=False),
+        Binding("left", "app.collapse_post", "Collapse", show=False),
+        Binding("enter", "app.toggle_post", "Collapse/expand", show=False),
+        Binding("space", "app.more", "Show more", show=False),
+        Binding("escape", "app.focus_list", "Back to list", show=False),
+    ]
+
+    def __init__(self, item: core.ThreadItem, replies: int):
         super().__init__(classes=f"post depth{min(item.depth, 6)}")
         self.item = item
+        self.replies = replies  # descendants, for the collapsed summary
+        self.collapsed = item.depth > OPEN_DEPTH
+        self.show_all = False
+
+    @property
+    def long(self) -> bool:
+        return self.item.body is not None and len(self.item.body.splitlines()) > SHOW_LINES
 
     def compose(self) -> ComposeResult:
+        yield Static(self._head(), classes="post-head")
+        yield Static(self._meta(), classes="post-meta")
+        yield Vertical(classes="post-body")
+
+    def on_mount(self) -> None:
+        self.render_state()
+
+    def _head(self) -> Text:
         v = self.item.view
         head = Text()
+        head.append("▸ " if self.collapsed else "▾ ", style="dim")
         head.append(f"#{v.article_num} ", style="bold cyan")
         head.append(v.subject or "(no subject)", style="bold")
+        return head
+
+    def _meta(self) -> Text:
+        v = self.item.view
         meta = Text(f"{core.author_label(v)} · {when(v.created_at)}")
         if v.pin_state == "pinned":
             meta.append(" · pinned")
         if v.visibility != "active":
             meta.append(f" · {v.visibility}", style="yellow")
-        yield Static(head, classes="post-head")
-        yield Static(meta, classes="post-meta")
-        if self.item.body is None:
-            yield Static(Text(f"[body {self.item.note or v.body_state}]", style="dim italic"))
-        elif "markdown" in (v.content_type or ""):
-            yield Markdown(self.item.body)
+        if self.collapsed and self.replies:
+            meta.append(f" · {self.replies} repl{'y' if self.replies == 1 else 'ies'} hidden", style="yellow")
+        return meta
+
+    def render_state(self) -> None:
+        """Redraw the header and body for the current collapsed / show-more state."""
+        self.query_one(".post-head", Static).update(self._head())
+        self.query_one(".post-meta", Static).update(self._meta())
+        box = self.query_one(".post-body", Vertical)
+        box.remove_children()
+        if self.collapsed:
+            return
+        body, v = self.item.body, self.item.view
+        if body is None:
+            box.mount(Static(Text(f"[body {self.item.note or v.body_state}]", style="dim italic")))
+            return
+        shown = body
+        if self.long and not self.show_all:
+            shown = "\n".join(body.splitlines()[:SHOW_LINES])
+        if "markdown" in (v.content_type or ""):
+            box.mount(Markdown(shown, open_links=False))
         else:
-            yield Static(Text(self.item.body))
+            box.mount(Static(Text(shown)))
+        if self.long:
+            hidden = len(body.splitlines()) - SHOW_LINES
+            box.mount(Static(
+                Text("show less (space)" if self.show_all else f"… {hidden} more line{'s' if hidden != 1 else ''} (space)",
+                     style="italic cyan"),
+                classes="more",
+            ))
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +281,7 @@ class Login(Screen[Account]):
         ol = self.query_one("#login-users", OptionList)
         has_users = ol.option_count > 0
         self.query_one("#login-mode", Label).update(
-            "Create a user. Their password also encrypts their Bonnet keys." if self.creating else "Log in"
+            "New user. The password also encrypts their Bonnet keys." if self.creating else "Log in"
         )
         ol.display = has_users and not self.creating
         self.query_one("#login-pw2", Input).display = self.creating
@@ -323,6 +384,136 @@ class Show(ModalScreen[None]):
         self.dismiss(None)
 
 
+class LinkPicker(ModalScreen["links.Link | None"]):
+    """Every link in a post. Enter follows one."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, found: list):
+        super().__init__()
+        self.found = found
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label(Text("Links in this post", style="bold"))
+            ol = OptionList(id="links")
+            for k, link in enumerate(self.found):
+                tag = Text("post " if link.kind == "post" else "web  ", style="cyan" if link.kind == "post" else "magenta")
+                ol.add_option(Option(tag + Text(link.label), id=str(k)))
+            yield ol
+            yield Label(Text("enter: follow · esc: close", style="dim"))
+
+    def on_mount(self) -> None:
+        ol = self.query_one("#links", OptionList)
+        ol.highlighted = 0
+        ol.focus()
+
+    @on(OptionList.OptionSelected, "#links")
+    def picked(self, ev: OptionList.OptionSelected) -> None:
+        self.dismiss(self.found[int(ev.option.id)])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class OpenLink(ModalScreen[str]):
+    """Leaving scootaloo for a web link. Returns 'once', 'trust', or 'no'."""
+
+    BINDINGS = [Binding("escape", "no", "Cancel"), Binding("o", "once", "Open"), Binding("t", "trust", "Trust domain")]
+
+    def __init__(self, url: str, host: str):
+        super().__init__()
+        self.url, self.host = url, host
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label(Text("Open this link in your browser?", style="bold"))
+            yield Static(Text(self.url, style="bold magenta"), id="url")
+            yield Label(Text(f"It goes to {self.host}. Anyone can post a link, so check it's where you expect.", style="dim"))
+            with Horizontal(id="compose-buttons"):
+                yield Button("Open (o)", variant="primary", id="once")
+                yield Button(f"Trust {self.host} (t)", id="trust")
+                yield Button("Cancel (esc)", id="no")
+
+    def on_mount(self) -> None:
+        self.query_one("#no", Button).focus()
+
+    @on(Button.Pressed, "#once")
+    def action_once(self) -> None:
+        self.dismiss("once")
+
+    @on(Button.Pressed, "#trust")
+    def action_trust(self) -> None:
+        self.dismiss("trust")
+
+    @on(Button.Pressed, "#no")
+    def action_no(self) -> None:
+        self.dismiss("no")
+
+
+class Info(ModalScreen[str | None]):
+    """Everything about one article, with actions: jump to related posts, verify, copy IDs."""
+
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("I", "close", "Close", show=False)]
+
+    def __init__(self, item: core.ThreadItem, ref: core.BoardRef):
+        super().__init__()
+        self.item, self.ref = item, ref
+
+    def compose(self) -> ComposeResult:
+        v = self.item.view
+        rows = [
+            ("subject", v.subject or "(none)"),
+            ("article", f"#{v.article_num} on {self.ref.name} @ {self.ref.origin}" + ("" if self.ref.is_home else f" (via {self.ref.via})")),
+            ("posted", datetime.fromtimestamp(v.created_at).strftime("%Y-%m-%d %H:%M:%S")),
+            ("author", f"{v.author_username or '(no name claimed)'}  [{v.author_check}]"),
+            ("registrar", v.author_registrar or "—"),
+            ("author key", v.author_pubkey),
+            ("article id", v.article_id),
+            ("event id", v.event_id),
+            ("state", f"{v.visibility} · {v.pin_state} · thread {v.thread_state}"),
+            ("tags", v.tags or "—"),
+            ("content type", v.content_type or "—"),
+            ("body", f"{v.body_size} bytes · {v.body_state}" + (f" · {self.item.note}" if self.item.note else "")),
+            ("body hash", v.body_hash or "—"),
+            ("thread root", "this is the root" if core.is_zero(v.root_article_id) else v.root_article_id),
+            ("reply to", "—" if core.is_zero(v.reply_to_article_id) else v.reply_to_article_id),
+        ]
+        if v.replacement_article_id and not core.is_zero(v.replacement_article_id):
+            rows.append(("replaced by", v.replacement_article_id))
+        table = Text()
+        for k, val in rows:
+            table.append(f"{k:>13}  ", style="dim")
+            table.append(f"{val}\n")
+        with VerticalScroll(classes="dialog", id="info"):
+            yield Label(Text(f"#{v.article_num} {v.subject}", style="bold"))
+            yield Static(table, id="info-table")
+            ol = OptionList(id="info-actions")
+            if not core.is_zero(v.root_article_id):
+                ol.add_option(Option("go to the thread's root", id="goto:" + v.root_article_id))
+            if not core.is_zero(v.reply_to_article_id) and v.reply_to_article_id != v.root_article_id:
+                ol.add_option(Option("go to the post this replies to", id="goto:" + v.reply_to_article_id))
+            if v.replacement_article_id and not core.is_zero(v.replacement_article_id):
+                ol.add_option(Option("go to the newer version", id="goto:" + v.replacement_article_id))
+            ol.add_option(Option("verify signatures", id="verify"))
+            ol.add_option(Option("copy article id", id="copy:" + v.article_id))
+            ol.add_option(Option("copy event id", id="copy:" + v.event_id))
+            ol.add_option(Option("copy author key", id="copy:" + v.author_pubkey))
+            yield ol
+
+    def on_mount(self) -> None:
+        ol = self.query_one("#info-actions", OptionList)
+        ol.highlighted = 0
+        ol.focus()
+
+    @on(OptionList.OptionSelected, "#info-actions")
+    def picked(self, ev: OptionList.OptionSelected) -> None:
+        self.dismiss(ev.option.id)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 # ---------------------------------------------------------------------------
 # app
 # ---------------------------------------------------------------------------
@@ -337,6 +528,19 @@ class ScootalooApp(App):
     #boards { width: 32; height: 1fr; border-right: solid $primary-darken-2; }
     #threads { width: 1fr; height: 1fr; }
     #view { width: 1fr; border-left: solid $primary-darken-2; padding: 0 1; }
+    #panes.-stacked { layout: vertical; }
+    #panes.-stacked #boards { display: none; }
+    #panes.-stacked #threads { width: 1fr; height: 2fr; }
+    #panes.-stacked #view { width: 1fr; height: 3fr; border-left: none; border-top: solid $primary-darken-2; }
+    #panes.-two #boards { display: none; }
+    #panes.-show-boards #boards { display: block; }
+    .post-body { height: auto; }
+    .more { height: auto; margin-top: 0; }
+    #preview-label { color: $text-muted; padding: 0 1; }
+    #links { height: auto; max-height: 20; margin: 1 0; }
+    #url { margin: 1 0; }
+    #info-actions { height: auto; margin-top: 1; }
+    LinkPicker, OpenLink, Info { align: center middle; }
     #status { height: 1; background: $boost; color: $text-muted; padding: 0 1; }
     .post { height: auto; margin: 0 0 1 0; padding: 0 1; border-left: tall $primary; }
     .post:focus { border-left: tall $accent; background: $boost; }
@@ -357,11 +561,13 @@ class ScootalooApp(App):
     Login { align: center middle; }
     #login { width: 60; height: auto; border: thick $primary; background: $surface; padding: 1 2; }
     #login-title { margin-bottom: 1; }
+    #login-mode { width: 100%; height: auto; margin-bottom: 1; }
     #login-users { height: auto; max-height: 8; margin-bottom: 1; }
     #login Input { margin-bottom: 1; }
     #login-error { margin-top: 1; }
     """
     BINDINGS = [
+        Binding("question_mark", "help", "Keys"),
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
         Binding("n", "new_thread", "New"),
@@ -369,13 +575,24 @@ class ScootalooApp(App):
         Binding("e", "edit", "Edit"),
         Binding("d", "delete", "Delete"),
         Binding("slash", "search", "Search"),
+        Binding("l", "links", "Links"),
+        Binding("I", "info", "Info"),
         Binding("v", "verify", "Verify"),
+        Binding("g", "goto", "Go to #"),
         Binding("m", "mark_read", "Mark read"),
+        Binding("z", "maximize_pane", "Maximize"),
+        Binding("backslash", "cycle_layout", "Layout"),
+        Binding("left_square_bracket", "resize(-1)", "Narrower", show=False),
+        Binding("right_square_bracket", "resize(1)", "Wider", show=False),
+        Binding("b", "focus_boards", "Boards", show=False),
         Binding("o", "connect", "Connect"),
         Binding("i", "identity", "Identity"),
         Binding("ctrl+l", "switch_user", "User"),
         Binding("ctrl+k", "change_password", "Password", show=False),
     ]
+
+    LAYOUTS = ("three", "two", "stacked")  # three panes · list + thread · list above thread
+    NARROW = 100  # below this many columns, "three" stacks automatically
 
     REFRESH_SECONDS = 20
 
@@ -395,6 +612,12 @@ class ScootalooApp(App):
         self.search_label = ""
         self.rowmap: dict[str, tuple[core.BoardRef, int]] = {}
         self.thread: core.Thread | None = None
+        self.thread_cache: dict[tuple[core.BoardRef, int], tuple[int | None, core.Thread]] = {}
+        self.previewing: tuple[core.BoardRef, int] | None = None
+        self._preview_timer = None
+        self.layout_name = "three"
+        self.boards_width = 32
+        self.list_share = 50  # percent of the width (or height, stacked) the thread list gets
         self._busy = False
 
     # -- layout ---------------------------------------------------------------
@@ -413,6 +636,8 @@ class ScootalooApp(App):
     def on_mount(self) -> None:
         tree = self.query_one("#boards", Tree)
         tree.show_root = False
+        for pid in ("boards", "threads", "view"):
+            self.query_one(f"#{pid}").ALLOW_MAXIMIZE = True
         t = self.query_one("#threads", DataTable)
         t.add_column("", key="new", width=3)
         t.add_column("#", key="num", width=5)
@@ -421,6 +646,12 @@ class ScootalooApp(App):
         t.add_column("date", key="when", width=5)
         self.start()
         self.set_interval(self.REFRESH_SECONDS, self._tick)
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        """Until someone is logged in, only quitting makes sense (and only it shows in the footer)."""
+        if isinstance(self.screen, Login) and action != "quit":
+            return False
+        return True
 
     @property
     def target_ref(self) -> core.BoardRef | None:
@@ -470,6 +701,9 @@ class ScootalooApp(App):
     async def _enter(self, acct: Account) -> None:
         self.acct, self.ref, self.thread, self.mode = acct, None, None, "board"
         self.index = core.Index()
+        self.thread_cache = {}
+        self.previewing = None
+        self._load_layout()
         self.query_one("#threads", DataTable).clear()
         await self._clear_view("pick a thread")
         if self._relay:
@@ -639,6 +873,10 @@ class ScootalooApp(App):
 
     @on(Tree.NodeSelected, "#boards")
     def board_selected(self, ev: Tree.NodeSelected) -> None:
+        panes = self.query_one("#panes")
+        if panes.has_class("-show-boards"):
+            panes.remove_class("-show-boards")
+            self.query_one("#threads", DataTable).focus()
         if ev.node.data == INBOX:
             self.show_inbox()
         elif isinstance(ev.node.data, core.BoardRef):
@@ -700,6 +938,7 @@ class ScootalooApp(App):
 
     @on(DataTable.RowSelected, "#threads")
     def thread_selected(self, ev: DataTable.RowSelected) -> None:
+        self._cancel_preview()
         ref, num = self.rowmap[ev.row_key.value]
         self.open_thread(ref, num)
 
@@ -708,30 +947,168 @@ class ScootalooApp(App):
         await view.remove_children()
         await view.mount(Static(msg, id="empty"))
 
+    # -- the thread pane -----------------------------------------------------
+
+    def _head_of(self, ref: core.BoardRef) -> int | None:
+        snap = self.index.snaps.get(ref)
+        return snap.head_seq if snap else None
+
+    async def _load_thread(self, ref: core.BoardRef, num: int) -> core.Thread | None:
+        """From the cache when the origin's log hasn't moved since; else from the relay."""
+        head = self._head_of(ref)
+        hit = self.thread_cache.get((ref, num))
+        if hit and head is not None and hit[0] == head:
+            return hit[1]
+        th = await self._guard(core.thread(self.acct, ref, num))
+        if th is not None:
+            for item in th.items:  # any article in it opens the same thread
+                self.thread_cache[(ref, item.view.article_num)] = (head, th)
+        return th
+
+    @property
+    def posts(self) -> list[Post]:
+        return list(self.query_one("#view", VerticalScroll).query(Post))
+
+    def _apply_visibility(self) -> None:
+        """Hide every post under a collapsed one."""
+        hide_below = None
+        for p in self.posts:
+            if hide_below is not None and p.item.depth > hide_below:
+                p.display = False
+                continue
+            hide_below = None
+            p.display = True
+            if p.collapsed:
+                hide_below = p.item.depth
+
+    def _focus_post(self, post: Post | None) -> None:
+        if post is None:
+            return
+        post.focus()
+        self.query_one("#view", VerticalScroll).scroll_to_widget(post, animate=False)
+
+    def _reveal(self, target: Post) -> None:
+        """Expand every ancestor of `target` (and target itself) so it's visible."""
+        posts = self.posts
+        i = posts.index(target)
+        depth = target.item.depth
+        for p in reversed(posts[:i]):
+            if p.item.depth < depth:
+                if p.collapsed:
+                    p.collapsed = False
+                    p.render_state()
+                depth = p.item.depth
+        if target.collapsed:
+            target.collapsed = False
+            target.render_state()
+        self._apply_visibility()
+
+    def _cancel_preview(self) -> None:
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+            self._preview_timer = None
+
     @work(exclusive=True, group="view")
     async def open_thread(self, ref: core.BoardRef, num: int, focus_num: int | None = None) -> None:
-        await self._clear_view("loading…")
-        th = await self._guard(core.thread(self.acct, ref, num))
+        self._cancel_preview()
+        self.previewing = None
+        cached = self.thread_cache.get((ref, num))
+        if not (cached and cached[0] is not None and cached[0] == self._head_of(ref)):
+            await self._clear_view("loading…")
+        th = await self._load_thread(ref, num)
         view = self.query_one("#view", VerticalScroll)
         await view.remove_children()
         if th is None:
             return
         self.thread = th
-        posts = [Post(item) for item in th.items]
+        replies = self._descendants(th)
+        posts = [Post(item, replies[k]) for k, item in enumerate(th.items)]
         await view.mount_all(posts)
         if th.truncated:
             await view.mount(Static("thread truncated at 200 articles", id="empty"))
-        target = next((p for p in posts if p.item.view.article_num in (focus_num, num)), None)
-        if target and (focus_num or target.item.depth):
-            target.focus()
-            view.scroll_to_widget(target)
-        else:
-            view.scroll_home(animate=False)
+        self._apply_visibility()
+        want = focus_num or num
+        target = next((p for p in posts if p.item.view.article_num == want), posts[0] if posts else None)
+        if target is not None:
+            self._reveal(target)
+            self.call_after_refresh(self._focus_post, target)
         core.mark_read(self.acct, ref, [i.view.article_num for i in th.items])
         self._recount()
         self._relabel()
         self._rerender_list()
         self.set_status()
+
+    @staticmethod
+    def _descendants(th: core.Thread) -> list[int]:
+        counts = [0] * len(th.items)
+        for i, item in enumerate(th.items):
+            for later in th.items[i + 1:]:
+                if later.depth <= item.depth:
+                    break
+                counts[i] += 1
+        return counts
+
+    def _post_step(self, step: int) -> None:
+        visible = [p for p in self.posts if p.display]
+        if not visible:
+            return
+        cur = self.focused
+        if cur not in visible:
+            self._focus_post(visible[0])
+            return
+        i = visible.index(cur) + step
+        if 0 <= i < len(visible):
+            self._focus_post(visible[i])
+
+    def action_next_post(self) -> None:
+        self._post_step(1)
+
+    def action_prev_post(self) -> None:
+        self._post_step(-1)
+
+    def action_collapse_post(self) -> None:
+        p = self.focused
+        if not isinstance(p, Post):
+            return
+        if not p.collapsed and (p.replies or p.item.body):
+            p.collapsed = True
+            p.render_state()
+            self._apply_visibility()
+            return
+        posts = self.posts  # already collapsed: step out to the parent
+        i = posts.index(p)
+        parent = next((q for q in reversed(posts[:i]) if q.item.depth < p.item.depth), None)
+        self._focus_post(parent)
+
+    def action_expand_post(self) -> None:
+        p = self.focused
+        if not isinstance(p, Post):
+            return
+        if p.collapsed:
+            p.collapsed = False
+            p.render_state()
+            self._apply_visibility()
+        elif p.replies:
+            self._post_step(1)
+
+    def action_toggle_post(self) -> None:
+        p = self.focused
+        if isinstance(p, Post):
+            p.collapsed = not p.collapsed
+            p.render_state()
+            self._apply_visibility()
+
+    def action_more(self) -> None:
+        p = self.focused
+        if isinstance(p, Post):
+            if p.collapsed:
+                p.collapsed = False
+            elif p.long:
+                p.show_all = not p.show_all
+            else:
+                return
+            p.render_state()
+            self._apply_visibility()
 
     def _rerender_list(self) -> None:
         t = self.query_one("#threads", DataTable)
@@ -784,10 +1161,238 @@ class ScootalooApp(App):
     # -- reading tools -------------------------------------------------------
 
     def _focused_item(self) -> core.ThreadItem | None:
-        if not self.thread:
-            return None
         f = self.focused
-        return f.item if isinstance(f, Post) else self.thread.items[0]
+        if isinstance(f, Post):
+            return f.item
+        if self.thread:
+            return self.thread.items[0]
+        posts = self.posts
+        return posts[0].item if posts else None
+
+    def _item_ref(self) -> core.BoardRef | None:
+        if self.thread:
+            return self.thread.ref
+        return self.previewing[0] if self.previewing else None
+
+    # -- links ---------------------------------------------------------------
+
+    @work
+    async def action_links(self) -> None:
+        item = self._focused_item()
+        if not item:
+            self.notify("open a thread first", severity="warning")
+            return
+        found = links.find_links(item.body or "")
+        if not found:
+            self.notify("no links in this post")
+            return
+        link = await self.push_screen_wait(LinkPicker(found))
+        if link is not None:
+            await self._follow(link)
+
+    @on(Markdown.LinkClicked)
+    def link_clicked(self, ev: Markdown.LinkClicked) -> None:
+        href = ev.href.strip()
+        ev.stop()
+        m = links._MENTION.fullmatch(href)
+        self.run_worker(self._follow(links.Link("post", m.group(1)) if m else links.Link("web", href)))
+
+    async def _follow(self, link: "links.Link") -> None:
+        if link.kind == "post":
+            ref = self._item_ref() or (self.ref if self.mode == "board" else None)
+            if ref is None:
+                return
+            self.open_thread(ref, int(link.target), focus_num=int(link.target))
+            return
+        if not links.is_safe_web_url(link.target):
+            self.notify(f"not opening {link.target!r}: only http and https links are followed", severity="warning")
+            return
+        host = link.host
+        with core.read_state(self.acct) as st:
+            trusted = st.trusts(host)
+        if not trusted:
+            choice = await self.push_screen_wait(OpenLink(link.target, host))
+            if choice == "no":
+                return
+            if choice == "trust":
+                with core.read_state(self.acct) as st:
+                    st.trust(host)
+                self.notify(f"{host} trusted: its links open without asking")
+        self.open_url(link.target)
+
+    # -- metadata / go to ----------------------------------------------------
+
+    @work
+    async def action_info(self) -> None:
+        item, ref = self._focused_item(), self._item_ref()
+        if not item or not ref:
+            self.notify("open a thread first", severity="warning")
+            return
+        choice = await self.push_screen_wait(Info(item, ref))
+        if not choice:
+            return
+        kind, _, arg = choice.partition(":")
+        if kind == "copy":
+            self.copy_to_clipboard(arg)
+            self.notify("copied")
+        elif kind == "verify":
+            self.action_verify()
+        elif kind == "goto":
+            num = await self._guard(core.num_for_id(self.acct, ref, arg))
+            if num is not None:
+                self.open_thread(ref, num, focus_num=num)
+
+    @work
+    async def action_goto(self) -> None:
+        ref = self._item_ref() or (self.ref if self.mode == "board" else None)
+        if ref is None:
+            self.notify("pick a board first", severity="warning")
+            return
+        answer = await self.push_screen_wait(Ask(f"go to post # on {ref.label}"))
+        if not answer:
+            return
+        try:
+            num = int(answer.lstrip("#").strip())
+        except ValueError:
+            self.notify(f"{answer!r} isn't a post number", severity="warning")
+            return
+        self.open_thread(ref, num, focus_num=num)
+
+    # -- previewing the OP while moving through the list ------------------------
+
+    @on(DataTable.RowHighlighted, "#threads")
+    def row_highlighted(self, ev: DataTable.RowHighlighted) -> None:
+        if ev.row_key is None or ev.row_key.value not in self.rowmap:
+            return
+        if self.focused is not self.query_one("#threads", DataTable):
+            return  # only skim when you're the one moving through the list
+        self._cancel_preview()
+        ref, num = self.rowmap[ev.row_key.value]
+        self._preview_timer = self.set_timer(0.15, lambda: self.show_preview(ref, num))
+
+    def on_descendant_focus(self, event) -> None:
+        """Coming back to the list with no thread open previews the row under the cursor."""
+        t = self.query_one("#threads", DataTable)
+        if event.widget is t and self.thread is None and t.row_count:
+            key = t.coordinate_to_cell_key((t.cursor_row, 0)).row_key.value
+            if key in self.rowmap:
+                self._cancel_preview()
+                ref, num = self.rowmap[key]
+                self._preview_timer = self.set_timer(0.15, lambda: self.show_preview(ref, num))
+
+    @work(exclusive=True, group="view")
+    async def show_preview(self, ref: core.BoardRef, num: int) -> None:
+        row = next((r for r in self.index.rows(ref) if r.article_num == num), None)
+        if row is not None:
+            body = await self._guard(core.preview(self.acct, ref, row))
+            item = core.ThreadItem(view=row, depth=0, body=body, note="" if body is not None else "unavailable")
+        else:
+            item = await self._guard(core.article(self.acct, ref, num))
+            if item is None:
+                return
+        view = self.query_one("#view", VerticalScroll)
+        await view.remove_children()
+        self.thread, self.previewing = None, (ref, num)
+        await view.mount(Static(Text("preview · enter opens the thread", style="dim italic"), id="preview-label"))
+        await view.mount(Post(item, 0))
+        view.scroll_home(animate=False)
+        self.set_status()
+
+    # -- layout ----------------------------------------------------------------
+
+    def _pane_of(self, widget) -> str | None:
+        for pid in ("boards", "threads", "view"):
+            pane = self.query_one(f"#{pid}")
+            if widget is pane or (widget is not None and pane in widget.ancestors):
+                return pid
+        return None
+
+    def action_maximize_pane(self) -> None:
+        screen = self.screen
+        if screen.maximized is not None:
+            screen.minimize()
+            return
+        pid = self._pane_of(self.focused) or "view"
+        screen.maximize(self.query_one(f"#{pid}"), container=False)
+
+    def action_cycle_layout(self) -> None:
+        i = self.LAYOUTS.index(self.layout_name)
+        self.layout_name = self.LAYOUTS[(i + 1) % len(self.LAYOUTS)]
+        self._save_layout()
+        self._apply_layout()
+        self.notify(f"layout: {self._effective_layout()}")
+
+    def action_resize(self, step: int) -> None:
+        pid = self._pane_of(self.focused)
+        if pid == "boards":
+            self.boards_width = max(16, min(80, self.boards_width + 4 * step))
+        elif pid in ("threads", "view"):
+            grow = step if pid == "threads" else -step
+            self.list_share = max(15, min(85, self.list_share + 5 * grow))
+        else:
+            return
+        self._save_layout()
+        self._apply_layout()
+
+    def _effective_layout(self) -> str:
+        if self.layout_name == "three" and self.size.width < self.NARROW:
+            return "stacked"
+        return self.layout_name
+
+    def _apply_layout(self) -> None:
+        panes = self.query_one("#panes")
+        name = self._effective_layout()
+        panes.set_class(name == "stacked", "-stacked")
+        panes.set_class(name == "two", "-two")
+        self.query_one("#boards").styles.width = self.boards_width
+        threads, view = self.query_one("#threads"), self.query_one("#view")
+        if name == "stacked":
+            threads.styles.width = view.styles.width = "1fr"
+            threads.styles.height = f"{self.list_share}fr"
+            view.styles.height = f"{100 - self.list_share}fr"
+        else:
+            threads.styles.height = view.styles.height = "1fr"
+            threads.styles.width = f"{self.list_share}fr"
+            view.styles.width = f"{100 - self.list_share}fr"
+
+    def _load_layout(self) -> None:
+        with core.read_state(self.acct) as st:
+            name = st.get("layout.name", "three")
+            self.layout_name = name if name in self.LAYOUTS else "three"
+            self.boards_width = int(st.get("layout.boards_width", "32"))
+            self.list_share = int(st.get("layout.list_share", "50"))
+        self._apply_layout()
+
+    def _save_layout(self) -> None:
+        if not self.acct:
+            return
+        with core.read_state(self.acct) as st:
+            st.set("layout.name", self.layout_name)
+            st.set("layout.boards_width", str(self.boards_width))
+            st.set("layout.list_share", str(self.list_share))
+
+    def on_resize(self, event) -> None:
+        if self.acct:
+            self._apply_layout()
+
+    def action_focus_boards(self) -> None:
+        """Get to the board tree even when the layout hides it."""
+        panes = self.query_one("#panes")
+        if self._effective_layout() != "three":
+            panes.toggle_class("-show-boards")
+        if panes.has_class("-show-boards") or self._effective_layout() == "three":
+            self.query_one("#boards", Tree).focus()
+        else:
+            self.query_one("#threads", DataTable).focus()
+
+    def action_help(self) -> None:
+        if self.screen.query("HelpPanel"):
+            self.action_hide_help_panel()
+        else:
+            self.action_show_help_panel()
+
+    def action_focus_list(self) -> None:
+        self.query_one("#threads", DataTable).focus()
 
     @work
     async def action_search(self) -> None:
@@ -813,12 +1418,12 @@ class ScootalooApp(App):
 
     @work
     async def action_verify(self) -> None:
-        item = self._focused_item()
-        if not item:
+        item, ref = self._focused_item(), self._item_ref()
+        if not item or not ref:
             self.notify("open a thread first", severity="warning")
             return
         self.notify(f"checking #{item.view.article_num}…")
-        v = await self._guard(core.verify(self.acct, self.thread.ref, item.view.article_num))
+        v = await self._guard(core.verify(self.acct, ref, item.view.article_num))
         if v:
             from scootaloo.cli import verification_markup
 

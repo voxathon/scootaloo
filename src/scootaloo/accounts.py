@@ -8,7 +8,8 @@ scootaloo is an application, so it has local users. Each user has a password
     <home>/users/<name>/identities.db   Bonnet identities, keys wrapped with the user's password
     <home>/users/<name>/origins.db      relays this user has joined
     <home>/users/<name>/trust.db        origin keys this user has accepted
-    <home>/users/<name>/state.db        what this user has read (scootaloo's own)
+    <home>/users/<name>/state.db        what this user has read, trusted link domains, layout
+    <home>/users/<name>/cache.db        article bodies, keyed (and checked) by their hash
 
 Pins and joined origins are per user on purpose: accepting a key is a trust
 decision, and one person's decision shouldn't commit another.
@@ -37,7 +38,6 @@ from bonnet.gateway.identity import IdentityStore
 from bonnet.gateway.origins import OriginStore
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-MIN_PASSWORD = 8
 
 
 class AccountError(Exception):
@@ -63,6 +63,7 @@ class Stores:
     trust_path: str
     label: str
     state_path: str = ""
+    cache_path: str = ""
 
     @classmethod
     def for_user(cls, name: str) -> "Stores":
@@ -74,6 +75,7 @@ class Stores:
             os.path.join(d, "trust.db"),
             label=name,
             state_path=os.path.join(d, "state.db"),
+            cache_path=os.path.join(d, "cache.db"),
         )
 
     @classmethod
@@ -85,7 +87,8 @@ class Stores:
             os.makedirs(os.path.dirname(p), exist_ok=True)
         # Read state is scootaloo's own, so it stays in scootaloo's home even here.
         state = os.path.join(home(), "gateway-store-state.db")
-        return cls(*paths, label="gateway store", state_path=state)
+        cache = os.path.join(home(), "gateway-store-cache.db")
+        return cls(*paths, label="gateway store", state_path=state, cache_path=cache)
 
     def identities(self) -> IdentityStore:
         return IdentityStore(self.identities_path)
@@ -144,8 +147,8 @@ class Users:
     def add(self, name: str, password: str) -> None:
         if not NAME_RE.match(name):
             raise AccountError("user names are 1-32 characters: lowercase letters, digits, - and _, starting with a letter or digit")
-        if len(password) < MIN_PASSWORD:
-            raise AccountError(f"passwords need at least {MIN_PASSWORD} characters")
+        if not password:
+            raise AccountError("every user needs a password")
         if self.exists(name):
             raise AccountError(f"there's already a user called '{name}'")
         if os.path.exists(os.path.join(home(), "users", name)):
@@ -178,8 +181,8 @@ class Users:
         """
         if not self.verify(name, old):
             raise AccountError("wrong user name or password")
-        if len(new) < MIN_PASSWORD:
-            raise AccountError(f"passwords need at least {MIN_PASSWORD} characters")
+        if not new:
+            raise AccountError("every user needs a password")
         if new == old:
             raise AccountError("that's the same password")
 

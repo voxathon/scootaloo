@@ -23,12 +23,18 @@ def test_add_login_and_verify():
     [
         ("Bad Name", "longenough", "user names"),
         ("", "longenough", "user names"),
-        ("ok", "short", "at least"),
+        ("ok", "", "needs a password"),
     ],
 )
 def test_add_rejects(name, pw, msg):
     with Users() as u, pytest.raises(AccountError, match=msg):
         u.add(name, pw)
+
+
+def test_short_passwords_are_allowed():
+    with Users() as u:
+        u.add("tiny", "x")
+        assert u.verify("tiny", "x")
 
 
 def test_duplicate_user():
@@ -102,7 +108,7 @@ def test_change_password_reencrypts_keys():
 
 @pytest.mark.parametrize(
     "old,new,msg",
-    [("wrongpass", "newpass99", "wrong"), ("flutters1", "short", "at least"), ("flutters1", "flutters1", "same")],
+    [("wrongpass", "newpass99", "wrong"), ("flutters1", "", "needs a password"), ("flutters1", "flutters1", "same")],
 )
 def test_change_password_refusals_change_nothing(old, new, msg):
     with Users() as u:

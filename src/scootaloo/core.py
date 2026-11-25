@@ -469,22 +469,40 @@ class Thread:
     truncated: bool = False
 
 
-async def _body(c: FirehoseHTTPClient, ref: BoardRef, v) -> tuple[str | None, str]:
+def body_cache(acct: Account):
+    from scootaloo.bodycache import BodyCache
+
+    return BodyCache(acct.stores.cache_path)
+
+
+async def _body(c: FirehoseHTTPClient, ref: BoardRef, v, cache=None) -> tuple[str | None, str]:
+    """An article's body as text, from the cache when possible; (None, reason) when it can't be had."""
     if v.body_state == "purged":
         return None, "purged"
-    if getattr(v, "body", None) is not None:
-        return v.body.decode("utf-8", errors="replace"), ""
-    try:
-        raw = await c.get_article_body(ref.origin, ref.name, v.article_num)
-    except PinConfirmationRequired as p:
-        return None, f"stored on {p.origin}, whose key you haven't accepted: `scootaloo connect` to it to read"
-    except (ProtocolError, FirehoseClientError, OSError) as e:
-        return None, f"unavailable ({getattr(e, 'detail', None) or e})"
+    if getattr(v, "body_size", 1) == 0:
+        return "", ""
+    raw = getattr(v, "body", None)
+    if raw is None and cache is not None:
+        raw = cache.get(v.body_hash)
+    if raw is None:
+        try:
+            raw = await c.get_article_body(ref.origin, ref.name, v.article_num)
+        except PinConfirmationRequired as p:
+            return None, f"stored on {p.origin}, whose key you haven't accepted: `scootaloo connect` to it to read"
+        except (ProtocolError, FirehoseClientError, OSError) as e:
+            return None, f"unavailable ({getattr(e, 'detail', None) or e})"
+    if cache is not None:
+        cache.put(v.body_hash, raw)
     return raw.decode("utf-8", errors="replace"), ""
 
 
 async def thread(acct: Account, ref: BoardRef, num: int, limit: int = 200, bodies: bool = True) -> Thread:
-    """A whole thread (from any article in it), as a depth-first list."""
+    """A whole thread (from any article in it), as a depth-first list. Bodies come from the cache when held."""
+    with body_cache(acct) as cache:
+        return await _thread(acct, ref, num, limit, bodies, cache)
+
+
+async def _thread(acct, ref, num, limit, bodies, cache) -> Thread:
     async with session_for(acct, ref).reader() as c:
         try:
             view = await c.get_article(ref.origin, ref.name, num, include_body=False)
@@ -493,9 +511,9 @@ async def thread(acct: Account, ref: BoardRef, num: int, limit: int = 200, bodie
                 raise ScootalooError(f"no article #{num} in {ref.label}") from e
             raise
         if not is_zero(view.root_article_id):
-            root = await c.get_article_by_id(ref.origin, ref.name, bytes.fromhex(view.root_article_id), include_body=True)
+            root = await c.get_article_by_id(ref.origin, ref.name, bytes.fromhex(view.root_article_id), include_body=False)
         else:
-            root = await c.get_article(ref.origin, ref.name, view.article_num, include_body=True)
+            root = view
         replies = await _query(
             c, ref.origin, ref.name,
             [(_F_ROOT, _OP_EQ, _VT_BYTES, bytes.fromhex(root.article_id))], limit, False,
@@ -512,7 +530,7 @@ async def thread(acct: Account, ref: BoardRef, num: int, limit: int = 200, bodie
         out = Thread(ref=ref, root=root, truncated=len(replies) >= limit)
 
         async def walk(node, depth):
-            body, note = await _body(c, ref, node) if bodies else (None, "")
+            body, note = await _body(c, ref, node, cache) if bodies else (None, "")
             out.items.append(ThreadItem(view=node, depth=depth, body=body, note=note))
             for child in sorted(kids.get(node.article_id, []), key=lambda r: (r.created_at, r.article_num)):
                 await walk(child, depth + 1)
@@ -522,10 +540,34 @@ async def thread(acct: Account, ref: BoardRef, num: int, limit: int = 200, bodie
 
 
 async def article(acct: Account, ref: BoardRef, num: int) -> ThreadItem:
+    with body_cache(acct) as cache:
+        async with session_for(acct, ref).reader() as c:
+            v = await c.get_article(ref.origin, ref.name, num, include_body=False)
+            body, note = await _body(c, ref, v, cache)
+            return ThreadItem(view=v, depth=0, body=body, note=note)
+
+
+async def preview(acct: Account, ref: BoardRef, row) -> str | None:
+    """The body of a listed article, for skimming: the cache first, else one fetch (which fills the cache)."""
+    with body_cache(acct) as cache:
+        hit = cache.get(row.body_hash)
+        if hit is not None:
+            return hit.decode("utf-8", errors="replace")
+        async with session_for(acct, ref).reader() as c:
+            body, _ = await _body(c, ref, row, cache)
+            return body
+
+
+async def num_for_id(acct: Account, ref: BoardRef, article_id: str) -> int:
+    """The article number on `ref` of an article ID (to jump from metadata to a post)."""
     async with session_for(acct, ref).reader() as c:
-        v = await c.get_article(ref.origin, ref.name, num, include_body=True)
-        body, note = await _body(c, ref, v)
-        return ThreadItem(view=v, depth=0, body=body, note=note)
+        try:
+            v = await c.get_article_by_id(ref.origin, ref.name, bytes.fromhex(article_id), include_body=False)
+        except ProtocolError as e:
+            if e.code == _MISSING:
+                raise ScootalooError(f"no article {article_id[:16]}… on {ref.label}") from e
+            raise
+        return v.article_num
 
 
 async def latest_num(acct: Account, ref: BoardRef) -> int:

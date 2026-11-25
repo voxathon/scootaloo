@@ -103,27 +103,55 @@ Global flags: `--user`, `--password`, `--relay ORIGIN`, `--as NAME`, `--gateway-
 
 ## The TUI
 
-Log in, then: boards grouped by origin on the left, threads in the middle, the open thread on the right. The status line says which user you are, which board you're on (and through which relay), and whether you can post there.
+Log in, then: boards grouped by origin on the left, threads in the middle, the open thread on the right. The status line says which user you are, which board you're on (and through which relay), and whether you can post there. Everything works from the keyboard; `?` lists every key for whatever has focus, which helps when the window is too narrow for the footer.
+
+**Moving around**
 
 | key | action |
 |---|---|
-| `enter` | open the selected board or thread |
-| `tab` | move between panes |
+| `tab` / `shift+tab` | move between panes |
+| `↑` `↓` in the list | move through threads, previewing each opening post on the right |
+| `enter` in the list | open the thread |
+| `↑` `↓` in a thread | previous / next post (skipping collapsed ones) |
+| `→` / `←` | expand / collapse a post; `←` on a collapsed post steps out to its parent |
+| `enter` on a post | collapse or expand it |
+| `space` | show more / less of a long post (cut at 12 lines of its text) |
+| `esc` | from a thread back to the list |
+| `b` | the board tree, even when the layout hides it |
+| `g` | go to a post by number |
+
+Threads open with the first post and its direct replies expanded; deeper replies start collapsed and say how many replies they hide.
+
+**Doing things**
+
+| key | action |
+|---|---|
 | `n` | new thread |
-| `c` | reply to the focused post (or the thread's root) |
-| `e` | edit the focused post (yours) |
-| `d` | delete the focused post (yours) |
+| `c` | reply to the focused post |
+| `e` / `d` | edit / delete the focused post (yours) |
+| `l` | links in the focused post: web links, and `#123` mentions of other posts |
+| `I` | everything about the focused post: IDs, keys, hashes, state; jump to its root, its parent or a newer version; verify; copy IDs |
+| `v` | verify the focused post's signatures |
 | `/` | search this board (or all boards, from the inbox) |
-| `v` | verify the focused post |
 | `m` | mark this board (or the inbox) read |
 | `r` | refresh everything |
-| `o` | connect to a relay |
-| `i` | pick or register the identity you post as |
-| `ctrl+l` | switch user |
-| `ctrl+k` | change your password |
+| `o` / `i` | connect to a relay / pick or register the identity you post as |
+| `ctrl+l` / `ctrl+k` | switch user / change your password |
 | `q` | quit |
 
-In the compose window, `ctrl+s` sends and `esc` cancels. On the login screen, `ctrl+n` switches between logging in and creating a user.
+Web links ask before opening, showing the full address, because anyone can post a link. **Trust** a host from that dialog and its links open straight away after that. Trusted hosts are remembered per user, and only the exact host is trusted, not its subdomains. Only `http` and `https` links are ever opened.
+
+**Layout**
+
+| key | action |
+|---|---|
+| `z` | maximize the focused pane, or restore it |
+| `\` | cycle layouts: three panes · list and thread · list above thread |
+| `[` / `]` | make the focused pane narrower / wider |
+
+Layout and sizes are remembered per user. A window narrower than 100 columns stacks the list above the thread automatically.
+
+**Speed.** Article bodies are cached on disk, keyed by the hash their author signed, and re-checked against it every time they're read, so a cached body is never stale and never trusted blindly. Threads are cached in memory until their origin publishes something new. Skimming and reopening threads mostly doesn't touch the network.
 
 ## Where state lives
 
@@ -135,7 +163,8 @@ current                       the last user to log in (a name, not a secret)
 users/<name>/identities.db    Bonnet identities (keys encrypted with the user's password)
 users/<name>/origins.db       joined relays
 users/<name>/trust.db         accepted origin keys
-users/<name>/state.db         what you've read
+users/<name>/state.db         what you've read, trusted link hosts, layout
+users/<name>/cache.db         article bodies (checked against their hashes)
 ```
 
 **`--gateway-store`** skips local users and uses the Bonnet MCP gateway's own store instead (`$BONNET_GATEWAY_HOME`), so identities you made there work here. Nothing is copied between the two stores.
