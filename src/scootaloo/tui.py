@@ -324,6 +324,7 @@ class ScootalooApp(App):
         Binding("o", "connect", "Connect"),
         Binding("i", "identity", "Identity"),
         Binding("ctrl+l", "switch_user", "Switch user"),
+        Binding("ctrl+k", "change_password", "Password", show=False),
     ]
 
     def __init__(self, user: str | None = None, password: str | None = None,
@@ -417,6 +418,28 @@ class ScootalooApp(App):
         acct = await self.push_screen_wait(Login())
         await self._enter(acct)
         self.notify(f"logged in as {acct.name}")
+
+    @work
+    async def action_change_password(self) -> None:
+        if not self.acct or self.acct.gateway or isinstance(self.screen, Login):
+            return
+        old = await self.push_screen_wait(Ask(f"current password for {self.acct.name}", password=True))
+        if not old:
+            return
+        new = await self.push_screen_wait(Ask("new password", password=True))
+        if not new:
+            return
+        if await self.push_screen_wait(Ask("new password again", password=True)) != new:
+            self.notify("passwords didn't match; nothing changed", severity="warning")
+            return
+        try:
+            with Users() as u:
+                n = u.change_password(self.acct.name, old, new)
+        except AccountError as e:
+            self.notify(str(e), severity="error", timeout=8)
+            return
+        self.acct.password = new
+        self.notify(f"password changed; re-encrypted {n} key{'s' if n != 1 else ''}")
 
     async def _connect_flow(self, default_url: str) -> None:
         url = await self.push_screen_wait(Ask("connect to a relay (URL)", default_url))

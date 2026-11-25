@@ -163,6 +163,75 @@ class Users:
         set_current(name)
         return Account(Stores.for_user(name), name, password)
 
+    def change_password(self, name: str, old: str, new: str) -> int:
+        """Re-encrypt every identity key of `name` under `new`. Returns how many keys moved.
+
+        Builds a fresh identities database beside the old one, then swaps it
+        in, so a failure part-way leaves the old keys and old password intact.
+        The old database is kept as identities.db.bak until the password hash
+        is updated too.
+        """
+        if not self.verify(name, old):
+            raise AccountError("wrong user name or password")
+        if len(new) < MIN_PASSWORD:
+            raise AccountError(f"passwords need at least {MIN_PASSWORD} characters")
+        if new == old:
+            raise AccountError("that's the same password")
+
+        stores = Stores.for_user(name)
+        path = stores.identities_path
+        fresh_path, backup = path + ".new", path + ".bak"
+        for leftover in (fresh_path,):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+
+        old_store = stores.identities()
+        try:
+            rows = old_store.list_users()
+            conn = old_store._get_conn()
+            if conn.execute("SELECT COUNT(*) FROM venue_accounts").fetchone()[0]:
+                raise AccountError(
+                    "this user has venue accounts linked through the Bonnet gateway; "
+                    "scootaloo can't re-encrypt those yet, so nothing was changed"
+                )
+            seeds = []
+            for r in rows:
+                pw = old if old_store.is_wrapped(r["origin"], r["username"]) else None
+                try:
+                    seeds.append((r, old_store.get_private_key(r["origin"], r["username"], pw)))
+                except Exception as e:
+                    raise AccountError(
+                        f"couldn't unlock '{r['username']}' on {r['origin']} with the current password "
+                        f"({e}); nothing was changed"
+                    ) from e
+        finally:
+            old_store.close()
+
+        new_store = IdentityStore(fresh_path)
+        try:
+            for r, seed in seeds:
+                new_store.register(r["origin"], r["username"], new, private_key=seed)
+                if r["registered"]:
+                    new_store.mark_registered(r["origin"], r["username"])
+            for r, seed in seeds:  # prove every key opens under the new password before swapping
+                if new_store.get_private_key(r["origin"], r["username"], new) != seed:
+                    raise AccountError("re-encryption check failed; nothing was changed")
+        except Exception:
+            new_store.close()
+            os.remove(fresh_path)
+            raise
+        new_store.close()
+
+        if os.path.exists(path):
+            os.replace(path, backup)
+        os.replace(fresh_path, path)
+        h = bcrypt.hashpw(new.encode("utf-8"), bcrypt.gensalt())
+        self._db.execute("UPDATE users SET pw_hash = ? WHERE name = ?", (h, name))
+        self._db.commit()
+        if os.path.exists(backup):
+            os.remove(backup)
+        return len(seeds)
+
     def remove(self, name: str, password: str) -> None:
         if not self.verify(name, password):
             raise AccountError("wrong user name or password")

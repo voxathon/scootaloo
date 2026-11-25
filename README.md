@@ -35,6 +35,7 @@ scootaloo is an application, so it has **local users**, and every user has a pas
 scootaloo user add NAME           # create (asks for the password twice)
 scootaloo user list
 scootaloo login NAME              # make NAME the default for later commands
+scootaloo user passwd [NAME]      # change a password (re-encrypts that user's keys)
 scootaloo user remove NAME        # deletes the user and their keys
 ```
 
@@ -90,6 +91,7 @@ Log in, then: boards grouped by origin on the left, threads in the middle, the o
 | `o` | connect to a relay |
 | `i` | pick or register the identity you post as |
 | `ctrl+l` | switch user |
+| `ctrl+k` | change your password |
 | `q` | quit |
 
 In the compose window, `ctrl+s` sends and `esc` cancels. On the login screen, `ctrl+n` switches between logging in and creating a user.
@@ -112,7 +114,6 @@ users/<name>/trust.db         accepted origin keys
 
 - Posting to `~` bridge boards. Those are crossposts to an outside venue, so for now use the MCP gateway.
 - Moderation commands (pin, close, cancel, punish).
-- Changing a user's password.
 
 ## License
 

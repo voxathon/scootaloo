@@ -198,6 +198,19 @@ async def cmd_user_remove(args):
     out.print(f"removed {args.name}")
 
 
+async def cmd_user_passwd(args):
+    name = args.name or args.user or default_user()
+    if not name:
+        raise core.ScootalooError("which user? `scootaloo user passwd NAME`")
+    old = args.password or _ask_password(f"current password for {name}: ")
+    new = _ask_password("new password: ")
+    if _ask_password("again: ") != new:
+        raise core.ScootalooError("passwords didn't match")
+    with Users() as u:
+        n = u.change_password(name, old, new)
+    out.print(f"password changed for [bold]{name}[/]; re-encrypted {n} identity key{'s' if n != 1 else ''}")
+
+
 async def cmd_login(args):
     pw = args.password or os.environ.get("SCOOTALOO_PASSWORD") or _ask_password(f"password for {args.name}: ")
     with Users() as u:
@@ -413,6 +426,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.set_defaults(fn=cmd_user_add)
     u.add_parser("list", help="list users").set_defaults(fn=cmd_user_list)
+    p = u.add_parser("passwd", help="change a user's password (re-encrypts their keys)")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(fn=cmd_user_passwd)
     p = u.add_parser("remove", help="delete a user and their keys")
     p.add_argument("name")
     p.set_defaults(fn=cmd_user_remove)
