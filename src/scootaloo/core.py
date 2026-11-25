@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from bonnet.core.crypto import Identity
 from bonnet.gateway.firehose_client import FirehoseHTTPClient, default_verify_tls, is_loopback
@@ -998,3 +999,260 @@ async def verify(acct: Account, ref: BoardRef, num: int) -> Verification:
         author_key=rec.actor_pubkey.hex(), author_sig=sigs["author"], origin_sig=sigs["origin"],
         body=body_state, view_matches=not mismatches, mismatches=mismatches, hops=hops,
     )
+
+
+# ---------------------------------------------------------------------------
+# Identity export / import (bonnet-identities archives; see idarchive.py)
+# ---------------------------------------------------------------------------
+
+
+def _relay_info(acct: Account, origin: str):
+    from scootaloo.idarchive import Relay
+
+    o = acct.stores.origins()
+    try:
+        entry = o.get(origin)
+    finally:
+        o.close()
+    t = acct.stores.trust()
+    try:
+        pin = t.get_pin(origin)
+    finally:
+        t.close()
+    if entry is None:
+        return Relay(url="", verify_tls=True, origin_key=pin.hex() if pin else "")
+    return Relay(url=entry["url"], verify_tls=bool(entry["verify_tls"]), origin_key=pin.hex() if pin else "")
+
+
+def collect_identities(acct: Account, which: list[tuple[str, str]] | None = None) -> list:
+    """Unlock identities for export: all of them, or the (origin, username) pairs named."""
+    from scootaloo.idarchive import Entry
+
+    s = acct.stores.identities()
+    try:
+        rows = s.list_users()
+        if which is not None:
+            wanted = set(which)
+            missing = wanted - {(r["origin"], r["username"]) for r in rows}
+            if missing:
+                o, u = sorted(missing)[0]
+                raise ScootalooError(f"no identity '{u}' on {o}")
+            rows = [r for r in rows if (r["origin"], r["username"]) in wanted]
+        out = []
+        for r in rows:
+            pw = acct.password if r["wrapped"] else None
+            if r["wrapped"] and not pw:
+                raise ScootalooError(f"'{r['username']}' on {r['origin']} is password-protected: pass --password")
+            try:
+                seed = s.get_private_key(r["origin"], r["username"], pw)
+            except Exception as e:  # noqa: BLE001 — wrong password surfaces as a decrypt error
+                raise ScootalooError(f"couldn't unlock '{r['username']}' on {r['origin']}: {e}") from e
+            out.append(Entry(r["origin"], r["username"], seed.hex(), r["public_key"], bool(r["registered"]),
+                             _relay_info(acct, r["origin"])))
+        return out
+    finally:
+        s.close()
+
+
+def find_identities(acct: Account, name: str, origin: str | None = None) -> list[tuple[str, str]]:
+    """(origin, username) pairs matching a name (and origin, if given)."""
+    s = acct.stores.identities()
+    try:
+        rows = s.list_users(origin)
+    finally:
+        s.close()
+    return [(r["origin"], r["username"]) for r in rows if r["username"] == name]
+
+
+@dataclass
+class ImportPlan:
+    entry: object  # idarchive.Entry
+    action: str  # import | skip | conflict | corrupt
+    reason: str = ""
+
+
+def plan_import(acct: Account, entries: list) -> list[ImportPlan]:
+    """What importing each entry would do, without doing it."""
+    s = acct.stores.identities()
+    try:
+        held = {(r["origin"], r["username"]): r["public_key"] for r in s.list_users()}
+    finally:
+        s.close()
+    plans, seen = [], set()
+    for e in entries:
+        key = (e.origin, e.username)
+        if not e.intact:
+            plans.append(ImportPlan(e, "corrupt", "its key doesn't re-derive its public key"))
+        elif key in seen:
+            plans.append(ImportPlan(e, "skip", "listed twice in what you're importing"))
+        elif key not in held:
+            plans.append(ImportPlan(e, "import"))
+        elif held[key] == e.public_key_hex:
+            plans.append(ImportPlan(e, "skip", "you already have it"))
+        else:
+            plans.append(ImportPlan(e, "conflict", "you hold a different key under this name here"))
+        seen.add(key)
+    return plans
+
+
+@dataclass
+class ImportResult:
+    entry: object
+    outcome: str  # imported | replaced | skipped | refused | rejected
+    notes: list[str] = field(default_factory=list)
+    backup: str = ""
+
+
+def _backup_dir() -> str:
+    from scootaloo.accounts import home
+
+    d = os.path.join(home(), "backups")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _drop_identity(acct: Account, origin: str, username: str) -> None:
+    s = acct.stores.identities()
+    try:
+        conn = s._get_conn()
+        conn.execute("DELETE FROM identities WHERE origin = ? AND username = ?", (origin, username))
+        conn.execute("DELETE FROM venue_accounts WHERE origin = ? AND username = ?", (origin, username))
+        conn.commit()
+    finally:
+        s.close()
+
+
+async def _join_relay(acct: Account, e, confirm_pin) -> list[str]:
+    """Make sure the identity's relay is joined; pin silently only when its key is the archive's."""
+    notes = []
+    if e.origin in {r["origin"] for r in joined(acct)}:
+        pin = _relay_info(acct, e.origin).origin_key
+        if e.relay.origin_key and pin and pin != e.relay.origin_key:
+            notes.append(
+                f"the key you trust for {e.origin} differs from the one recorded in the archive; "
+                "if you didn't expect a key change, check it"
+            )
+        return notes
+    url = e.relay.url or f"https://{e.origin}"
+    try:
+        try:
+            await connect(acct, url, None if e.relay.verify_tls else False)
+            notes.append(f"joined {e.origin} ({url})")
+            return notes
+        except PinConfirmationRequired as p:
+            if p.kind == "new" and e.relay.origin_key and p.fingerprint == e.relay.origin_key:
+                accept_pin(acct, p)
+                await connect(acct, url, None if e.relay.verify_tls else False)
+                notes.append(f"joined {e.origin}; its key matches the archive's, so it was trusted without asking")
+                return notes
+            ok = await confirm_pin(p, url) if confirm_pin else False
+            if not ok:
+                decline_pin(acct, p)
+                notes.append(f"didn't join {e.origin}: its key wasn't trusted. `scootaloo connect {url}` later")
+                return notes
+            accept_pin(acct, p)
+            await connect(acct, url, None if e.relay.verify_tls else False)
+            notes.append(f"joined {e.origin}")
+            return notes
+    except (ProtocolError, FirehoseClientError, OSError, ScootalooError) as err:
+        notes.append(f"couldn't reach {e.origin} ({err}); the identity is imported, connect to it later")
+    return notes
+
+
+async def _liveness(acct: Account, e) -> list[str]:
+    if e.origin not in {r["origin"] for r in joined(acct)}:
+        return []
+    sess = Session.open(acct, e.origin)
+    sess.username = None  # ask anonymously: an unregistered key may not be allowed to look anything up
+    try:
+        async with sess.reader() as c:
+            u = await c.get_user(e.origin, bytes.fromhex(e.public_key_hex))
+    except ProtocolError as err:
+        if err.code == 0x0001:
+            return [f"{e.origin} doesn't know this key: it may never have been registered there"]
+        return [f"couldn't check the key with {e.origin} ({err.detail or err})"]
+    except (FirehoseClientError, OSError) as err:
+        return [f"couldn't check the key with {e.origin} ({err})"]
+    if u.revoked:
+        return [f"{e.origin} has REVOKED this key: it can't post there"]
+    if u.superseded_by:
+        return [f"this key was rotated away on {e.origin} (successor {u.superseded_by[:16]}…): it can't post there"]
+    if u.username and u.username != e.username:
+        return [f"{e.origin} knows this key as '{u.username}', not '{e.username}'"]
+    return []
+
+
+async def import_identities(
+    acct: Account, plans: list[ImportPlan], *, replace: bool = False,
+    backup_passphrase: str | None = None, confirm_pin=None, check_live: bool = True,
+) -> list[ImportResult]:
+    """Carry out a plan. Never publishes anything: the origins already know these keys.
+
+    `replace` lets a conflicting entry replace the identity held under its name,
+    after writing the held one to <home>/backups as an archive locked with
+    `backup_passphrase` (required). `confirm_pin(pending, url)` is awaited when a
+    relay presents a key the archive doesn't vouch for.
+    """
+    from scootaloo import __version__
+    from scootaloo.idarchive import build
+
+    wrap = acct.password if acct.wraps_keys else None
+    results = []
+    for plan in plans:
+        e = plan.entry
+        if plan.action == "corrupt":
+            results.append(ImportResult(e, "rejected", [plan.reason]))
+            continue
+        if plan.action == "skip":
+            results.append(ImportResult(e, "skipped", [plan.reason]))
+            continue
+        res = ImportResult(e, "imported")
+        if plan.action == "conflict":
+            if not replace:
+                results.append(ImportResult(e, "refused", [plan.reason + "; --replace swaps it (after a backup)"]))
+                continue
+            if not backup_passphrase:
+                raise ScootalooError("replacing an identity needs a passphrase for the backup of the one it replaces")
+            current = collect_identities(acct, [(e.origin, e.username)])
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            path = os.path.join(_backup_dir(), f"replaced-{e.username}@{e.origin}-{stamp}.bnid")
+            with open(path, "xb") as f:
+                f.write(build(current, backup_passphrase, f"scootaloo {__version__} (backup before replace)"))
+            res.backup = path
+            _drop_identity(acct, e.origin, e.username)
+            res.outcome = "replaced"
+        s = acct.stores.identities()
+        try:
+            s.register(e.origin, e.username, wrap, private_key=e.seed)
+            if e.registered:
+                s.mark_registered(e.origin, e.username)
+        finally:
+            s.close()
+        res.notes += await _join_relay(acct, e, confirm_pin)
+        if e.origin in {r["origin"] for r in joined(acct)}:
+            o = acct.stores.origins()
+            try:
+                if not (o.get(e.origin) or {}).get("identity"):
+                    use_identity(acct, e.origin, e.username)
+            finally:
+                o.close()
+            if check_live:
+                res.notes += await _liveness(acct, e)
+        results.append(res)
+    return results
+
+
+def write_archive(path: str, data: bytes, overwrite: bool = False) -> str:
+    """Write archive bytes atomically; never over an existing file unless asked."""
+    from scootaloo.idarchive import EXTENSION
+
+    if not path.endswith(EXTENSION):
+        path += EXTENSION
+    if os.path.exists(path) and not overwrite:
+        raise ScootalooError(f"{path} already exists (pass --force to overwrite)")
+    d = os.path.dirname(os.path.abspath(path))
+    tmp = os.path.join(d, f".{os.path.basename(path)}.tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return path

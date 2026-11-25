@@ -560,6 +560,137 @@ def print_verification(v: core.Verification) -> None:
     out.print(verification_markup(v))
 
 
+def _passphrase(env: str, prompt: str, twice: bool) -> str:
+    pw = os.environ.get(env)
+    if pw:
+        return pw
+    pw = _ask_password(prompt)
+    if not pw:
+        raise core.ScootalooError("an archive needs a passphrase")
+    if twice and _ask_password("again: ") != pw:
+        raise core.ScootalooError("passphrases didn't match")
+    return pw
+
+
+async def cmd_identity_export(args):
+    from scootaloo import idarchive
+
+    acct = account(args)
+    if args.all or not args.name:
+        if args.seed:
+            raise core.ScootalooError("--seed prints one identity: name it")
+        which = None
+    else:
+        which = core.find_identities(acct, args.name, args.origin)
+        if not which:
+            raise core.ScootalooError(f"no identity '{args.name}'" + (f" on {args.origin}" if args.origin else ""))
+        if len(which) > 1:
+            raise core.ScootalooError(
+                f"'{args.name}' exists on several origins ({', '.join(o for o, _ in which)}): add --origin"
+            )
+    entries = core.collect_identities(acct, which)
+    if not entries:
+        raise core.ScootalooError("no identities to export")
+
+    if args.seed:
+        e = entries[0]
+        err.print(f"[bold red]This prints {e.label}'s private key in plain text.[/] Anyone who sees it can post as you.")
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise core.ScootalooError("pass --yes to print a raw seed without a prompt")
+            if acct.gateway:
+                if not Confirm.ask("print it?", default=False, console=err):
+                    return
+            else:
+                again = _ask_password(f"password for {acct.name}, again: ")
+                with Users() as u:
+                    if not u.verify(acct.name, again):
+                        raise core.ScootalooError("wrong password")
+        print(idarchive.seed_json(e))
+        return
+
+    passphrase = _passphrase("SCOOTALOO_EXPORT_PASSPHRASE", "passphrase for the archive: ", twice=True)
+    if args.output:
+        path = args.output
+    elif len(entries) == 1:
+        path = f"{entries[0].username}@{entries[0].origin}"
+    else:
+        path = "identities-" + datetime.now().strftime("%Y%m%d-%H%M")
+    data = idarchive.build(entries, passphrase, f"scootaloo {__version__}")
+    path = core.write_archive(path, data, overwrite=args.force)
+    out.print(f"exported {len(entries)} identit{'y' if len(entries) == 1 else 'ies'} to [bold]{path}[/]")
+    for e in entries:
+        out.print(f"  {e.username} on {e.origin}")
+    out.print("[dim]Keep the passphrase somewhere other than the file: without it the archive can't be opened.[/]")
+
+
+async def cmd_identity_import(args):
+    from scootaloo import idarchive
+
+    acct = account(args)
+    if args.manual:
+        if args.file:
+            raise core.ScootalooError("--manual reads a pasted seed or gateway JSON, not a file")
+        text = sys.stdin.read() if not sys.stdin.isatty() else _ask_password(
+            "paste the seed (64 hex) or the gateway's export_identity JSON: ")
+        entry = idarchive.parse_manual(text, args.origin or "", args.name or "")
+        if args.url:
+            entry.relay.url = args.url
+        entries, rejected, source = [entry], [], "pasted identity"
+    else:
+        if not args.file:
+            raise core.ScootalooError("name an archive file, or use --manual")
+        with open(args.file, "rb") as f:
+            data = f.read()
+        idarchive.check_envelope(data)
+        passphrase = _passphrase("SCOOTALOO_IMPORT_PASSPHRASE", f"passphrase for {args.file}: ", twice=False)
+        opened = idarchive.open_archive(data, passphrase)
+        entries, rejected = opened.entries, opened.rejected
+        source = f"{args.file} (made {opened.exported_at or 'at an unknown time'} by {opened.exported_by or 'unknown'})"
+        if args.only:
+            wanted = {tuple(x.split("/", 1)) if "/" in x else ("", x) for x in args.only}
+            entries = [e for e in entries if (e.origin, e.username) in wanted or ("", e.username) in wanted]
+            if not entries:
+                raise core.ScootalooError("--only matched nothing in the archive")
+
+    plans = core.plan_import(acct, entries)
+    out.print(f"[bold]{source}[/]")
+    words = {"import": "[green]import[/]", "skip": "[dim]skip[/]", "conflict": "[yellow]conflict[/]", "corrupt": "[red]corrupt[/]"}
+    for p in plans:
+        out.print(f"  {words[p.action]:<22} {p.entry.label}" + (f" [dim]({p.reason})[/]" if p.reason else ""))
+    for what, why in rejected:
+        out.print(f"  [red]unreadable[/]  {what} [dim]({why})[/]")
+    if args.dry_run:
+        return
+
+    backup_pw = None
+    if args.replace and any(p.action == "conflict" for p in plans):
+        n = sum(p.action == "conflict" for p in plans)
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise core.ScootalooError("pass --yes to replace identities without a prompt")
+            if not Confirm.ask(f"replace {n} identit{'y' if n == 1 else 'ies'} you hold? They'll be backed up first",
+                               default=False, console=err):
+                return
+        backup_pw = _passphrase("SCOOTALOO_EXPORT_PASSPHRASE", "passphrase for the backup of what's replaced: ", twice=True)
+
+    async def confirm(p, url):
+        if not sys.stdin.isatty():
+            return False
+        kind = "has a DIFFERENT key than the archive recorded" if p.kind == "new" else "presents a CHANGED key"
+        err.print(f"[yellow]{p.origin} ({url}) {kind}.[/] fingerprint: [bold]{p.fingerprint}[/]")
+        return Confirm.ask("trust this key?", default=False, console=err)
+
+    results = await core.import_identities(acct, plans, replace=args.replace, backup_passphrase=backup_pw, confirm_pin=confirm)
+    for r in results:
+        colour = {"imported": "green", "replaced": "yellow", "skipped": "dim", "refused": "yellow", "rejected": "red"}[r.outcome]
+        out.print(f"[{colour}]{r.outcome}[/] {r.entry.label}")
+        if r.backup:
+            out.print(f"    the identity it replaced is backed up in {r.backup}")
+        for note in r.notes:
+            out.print(f"    [dim]{note}[/]")
+
+
 async def cmd_tail(args):
     acct = account(args)
     ref = await board_ref(args, acct)
@@ -698,6 +829,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-b", "--back", type=int, default=5, help="also show this many recent posts")
     p.set_defaults(fn=cmd_tail)
 
+    ident = sub.add_parser("identity", help="export or import Bonnet identities").add_subparsers(
+        dest="icmd", metavar="<action>", required=True)
+    p = ident.add_parser("export", help="write identities to an encrypted .bnid archive")
+    p.add_argument("name", nargs="?", help="one identity (default: all of them)")
+    p.add_argument("--all", action="store_true", help="every identity you hold")
+    p.add_argument("--origin", help="which origin, when the name is on several")
+    p.add_argument("-o", "--output", help="file to write (default: NAME@ORIGIN.bnid or identities-DATE.bnid)")
+    p.add_argument("--force", action="store_true", help="overwrite an existing file")
+    p.add_argument("--seed", action="store_true", help="print one identity's raw seed, gateway-style, instead")
+    p.add_argument("-y", "--yes", action="store_true", help="don't ask before printing a raw seed")
+    p.set_defaults(fn=cmd_identity_export)
+    p = ident.add_parser("import", help="import identities from a .bnid archive, or a pasted seed")
+    p.add_argument("file", nargs="?", help="the .bnid archive")
+    p.add_argument("--only", action="append", metavar="ORIGIN/NAME", help="import just this one (repeatable)")
+    p.add_argument("--replace", action="store_true", help="replace an identity you hold under the same name (backed up first)")
+    p.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
+    p.add_argument("--manual", action="store_true", help="paste a 64-hex seed or the gateway's export_identity JSON")
+    p.add_argument("--origin", help="with --manual and a bare seed: the identity's origin")
+    p.add_argument("--name", help="with --manual and a bare seed: the identity's username")
+    p.add_argument("--url", help="with --manual: the relay URL (default https://ORIGIN)")
+    p.add_argument("-y", "--yes", action="store_true", help="don't ask before replacing")
+    p.set_defaults(fn=cmd_identity_import)
+
     sub.add_parser("unread", help="boards with unread posts").set_defaults(fn=cmd_unread)
 
     p = sub.add_parser("inbox", help="replies to your posts")
@@ -753,6 +907,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except core.ProtocolError as e:
         err.print(f"[red]server said:[/] {e.detail or e}")
+        return 1
+    except FileNotFoundError as e:
+        err.print(f"[red]no such file: {e.filename}[/]")
         return 1
     except (core.ScootalooError, AccountError, core.FirehoseClientError, ValueError) as e:
         err.print(f"[red]{e}[/]")

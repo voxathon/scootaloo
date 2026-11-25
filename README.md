@@ -43,6 +43,30 @@ Each command logs in as `--user`, else `$SCOOTALOO_USER`, else whoever logged in
 
 In the TUI you log in once (`ctrl+l` switches user). With one user, it only asks for that user's password. With several, it shows a menu of names, and picking one leads to its password (`esc` goes back). Set `scootaloo config login.list_users false` to get a blank name and password form instead. `ctrl+n` creates a user from any of these.
 
+## Moving identities
+
+Bonnet identities move between machines, users and clients as **`bonnet-identities`** archives (`.bnid`). A `.bnid` file is JSON around one encrypted payload. Its key comes from a passphrase you choose when exporting (argon2id), and the payload is sealed with XSalsa20-Poly1305. Without the passphrase, the file reveals only what kind of file it is, not even which identities are inside. Only identities move: users, read state, preferences and caches stay local.
+
+```
+scootaloo identity export --all                 # every identity -> identities-DATE.bnid
+scootaloo identity export NAME [-o FILE]        # one identity -> NAME@ORIGIN.bnid
+scootaloo identity import FILE [--dry-run]      # shows what it will do, then does it
+scootaloo identity import FILE --only ORIGIN/NAME
+scootaloo identity import --manual              # paste a 64-hex seed, or the gateway's export_identity JSON
+scootaloo identity export NAME --seed           # one raw seed, gateway-shaped (asks for your password again)
+```
+
+Importing:
+
+- **Never overwrites anything.** An identity you already hold is skipped. A *different* key under the same origin and name is refused, unless you pass `--replace`, and then the identity being replaced is first saved to `backups/` as its own archive.
+- **Checks each key**: the private key must reproduce the stored public key, and the origin is asked whether the key is still live (not revoked, not rotated away).
+- **Joins the identity's relay if needed.** A relay presenting the same key the archive recorded is trusted without asking. A different key gets the usual changed-key prompt.
+- **Re-encrypts the key** with *your* scootaloo password. Nothing is published: the origin already knows the key.
+
+The field names match the Bonnet gateway's `export_identity` output (`private_key_hex`, `public_key_hex`), so a gateway identity imports with one paste. Going the other way, `--seed` prints what the gateway's `register(…, private_key_hex=…)` takes. In the TUI, `i` opens the identity manager: choose the identity you post as, register a new one, export the selected one (`x`) or all of them, and import from a file or a paste.
+
+For scripts, `SCOOTALOO_EXPORT_PASSPHRASE` and `SCOOTALOO_IMPORT_PASSPHRASE` supply the archive passphrases.
+
 ## Reading other origins
 
 A relay serves every origin it syncs, not just its own, so `scootaloo boards` lists boards from every origin your relays can see. Name a board on another origin as `name@origin` or with `--from ORIGIN`:
@@ -84,6 +108,7 @@ The TUI shows unread counts on boards and an **Inbox** at the top of the board t
 | `scootaloo relay ORIGIN` | switch the active relay |
 | `scootaloo register NAME` | create an identity on the active relay |
 | `scootaloo use NAME` | switch the identity you post as on that relay |
+| `scootaloo identity export / import` | move identities in `.bnid` archives (see above) |
 | `scootaloo whoami` | your user, relays, and identities |
 | `scootaloo boards` | every board you can read, by origin |
 | `scootaloo mkboard NAME [--title T]` | create a board you own |
@@ -139,7 +164,8 @@ Threads open with the first post and its direct replies expanded; deeper replies
 | `/` | search this board (or all boards, from the inbox) |
 | `m` | mark this board (or the inbox) read |
 | `r` | refresh everything |
-| `o` / `i` | connect to a relay / pick or register the identity you post as |
+| `o` | connect to a relay |
+| `i` | identities: post as, register, export, import |
 | `ctrl+l` / `ctrl+k` | switch user / change your password |
 | `q` | quit |
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 from rich.text import Text
@@ -25,7 +26,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from scootaloo import core, links, settings
+from scootaloo import core, idarchive, links, settings
 from scootaloo.accounts import Account, AccountError, Stores, Users, default_user
 
 
@@ -570,6 +571,80 @@ class Info(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class Identities(ModalScreen[tuple | None]):
+    """Your Bonnet identities across relays. Returns what to do: ('use'|'export', origin, name) or (action,)."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("x", "export_one", "Export selected"),
+    ]
+
+    def __init__(self, acct: Account, relay: str | None):
+        super().__init__()
+        self.acct, self.relay = acct, relay
+
+    def compose(self) -> ComposeResult:
+        s = self.acct.stores.identities()
+        try:
+            rows = s.list_users()
+        finally:
+            s.close()
+        posting = {r["origin"]: r["identity"] for r in core.joined(self.acct)}
+        with Vertical(classes="dialog", id="identities"):
+            yield Label(Text(f"Identities · {self.acct.name}", style="bold"))
+            ol = OptionList(id="id-list")
+            for r in sorted(rows, key=lambda r: (r["origin"], r["username"])):
+                t = Text(f"{r['username']}", style="bold")
+                t.append(f"  on {r['origin']}", style="")
+                if posting.get(r["origin"]) == r["username"]:
+                    t.append("  · posting", style="green")
+                if not r["registered"]:
+                    t.append("  · not registered", style="yellow")
+                ol.add_option(Option(t, id=f"id\x00{r['origin']}\x00{r['username']}"))
+            if rows:
+                ol.add_option(None)
+            if self.relay:
+                ol.add_option(Option(f"Register a new identity on {self.relay}…", id="register"))
+            if rows:
+                ol.add_option(Option("Export all identities…", id="export-all"))
+            ol.add_option(Option("Import from a .bnid archive…", id="import-file"))
+            ol.add_option(Option("Import a pasted seed or gateway JSON…", id="import-manual"))
+            yield ol
+            yield Label(Text("enter: post as / choose · x: export the selected identity · esc: close", style="dim"))
+
+    def on_mount(self) -> None:
+        ol = self.query_one("#id-list", OptionList)
+        ol.highlighted = 0
+        ol.focus()
+
+    def _selected_identity(self):
+        ol = self.query_one("#id-list", OptionList)
+        if ol.highlighted is None:
+            return None
+        oid = ol.get_option_at_index(ol.highlighted).id or ""
+        if oid.startswith("id\x00"):
+            _, origin, name = oid.split("\x00", 2)
+            return origin, name
+        return None
+
+    @on(OptionList.OptionSelected, "#id-list")
+    def picked(self, ev: OptionList.OptionSelected) -> None:
+        oid = ev.option.id or ""
+        if oid.startswith("id\x00"):
+            _, origin, name = oid.split("\x00", 2)
+            self.dismiss(("use", origin, name))
+        else:
+            self.dismiss((oid,))
+
+    def action_export_one(self) -> None:
+        sel = self._selected_identity()
+        if sel:
+            self.dismiss(("export", *sel))
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 # ---------------------------------------------------------------------------
 # app
 # ---------------------------------------------------------------------------
@@ -597,7 +672,8 @@ class ScootalooApp(App):
     #links { height: auto; max-height: 20; margin: 1 0; }
     #url { margin: 1 0; }
     #info-actions { height: auto; margin-top: 1; }
-    LinkPicker, OpenLink, Info { align: center middle; }
+    LinkPicker, OpenLink, Info, Identities { align: center middle; }
+    #id-list { height: auto; max-height: 24; margin: 1 0; }
     #status { height: 1; background: $boost; color: $text-muted; padding: 0 1; }
     .post { height: auto; margin: 0 0 1 0; padding: 0 1; border-left: tall $primary; }
     .post:focus { border-left: tall $accent; background: $boost; }
@@ -645,7 +721,7 @@ class ScootalooApp(App):
         Binding("right_square_bracket", "resize(1)", "Wider", show=False),
         Binding("b", "focus_boards", "Boards", show=False),
         Binding("o", "connect", "Connect"),
-        Binding("i", "identity", "Identity"),
+        Binding("i", "identity", "Identities"),
         Binding("ctrl+l", "switch_user", "User"),
         Binding("ctrl+k", "change_password", "Password", show=False),
     ]
@@ -838,30 +914,129 @@ class ScootalooApp(App):
 
     @work
     async def action_identity(self) -> None:
-        """Pick or register the identity you post as on the relay you're looking at."""
+        """The identity manager: post as, register, export, import."""
         if not self.acct:
             return
         ref = self.target_ref
         relay = ref.via if ref else (core.active_relay(self.acct) or {}).get("origin")
-        if not relay:
-            self.notify("connect to a relay first (o)", severity="warning")
-            return
-        ids = [i["username"] for i in core.identities(self.acct, relay)]
-        current = core.Session.open(self.acct, relay).username or ""
-        hint = f"have: {', '.join(ids)}" if ids else "a new name registers it"
-        name = await self.push_screen_wait(Ask(f"post as, on {relay} ({hint})", current))
-        if not name:
+        choice = await self.push_screen_wait(Identities(self.acct, relay))
+        if not choice:
             return
         try:
-            if name in ids:
-                core.use_identity(self.acct, relay, name)
-                self.notify(f"posting as {name} on {relay}")
-            else:
-                r = await core.register(core.Session.open(self.acct, relay), name)
-                self.notify(f"registered {r['username']} on {relay}")
+            if choice[0] == "use":
+                core.use_identity(self.acct, choice[1], choice[2])
+                self.notify(f"posting as {choice[2]} on {choice[1]}")
+            elif choice[0] == "register":
+                name = await self.push_screen_wait(Ask(f"new identity's name on {relay}"))
+                if name:
+                    r = await core.register(core.Session.open(self.acct, relay), name)
+                    self.notify(f"registered {r['username']} on {relay}")
+            elif choice[0] == "export":
+                await self._export([(choice[1], choice[2])])
+            elif choice[0] == "export-all":
+                await self._export(None)
+            elif choice[0] == "import-file":
+                await self._import_file()
+            elif choice[0] == "import-manual":
+                await self._import_manual()
+        except (core.ScootalooError, idarchive.ArchiveError, OSError) as e:
+            self.notify(str(e), severity="error", timeout=10)
         except Exception as e:  # noqa: BLE001
-            self.notify(str(e), severity="error", timeout=8)
+            self.notify(str(e), severity="error", timeout=10)
         self.set_status()
+
+    async def _new_passphrase(self, what: str) -> str | None:
+        pw = await self.push_screen_wait(Ask(f"passphrase for {what}", password=True))
+        if not pw:
+            return None
+        if await self.push_screen_wait(Ask("the same passphrase again", password=True)) != pw:
+            self.notify("passphrases didn't match; nothing written", severity="warning")
+            return None
+        return pw
+
+    async def _export(self, which) -> None:
+        from scootaloo import __version__
+
+        entries = core.collect_identities(self.acct, which)
+        if not entries:
+            self.notify("no identities to export", severity="warning")
+            return
+        default = (f"{entries[0].username}@{entries[0].origin}" if len(entries) == 1
+                   else "identities-" + datetime.now().strftime("%Y%m%d-%H%M")) + idarchive.EXTENSION
+        path = await self.push_screen_wait(Ask("save the archive as", os.path.join(os.path.expanduser("~"), default)))
+        if not path:
+            return
+        pw = await self._new_passphrase("the archive (keep it somewhere other than the file)")
+        if not pw:
+            return
+        data = idarchive.build(entries, pw, f"scootaloo {__version__}")
+        written = core.write_archive(os.path.expanduser(path), data)
+        self.notify(f"exported {len(entries)} identit{'y' if len(entries) == 1 else 'ies'} to {written}", timeout=10)
+
+    async def _import_file(self) -> None:
+        path = await self.push_screen_wait(Ask("archive to import (.bnid)"))
+        if not path:
+            return
+        with open(os.path.expanduser(path), "rb") as f:
+            data = f.read()
+        idarchive.check_envelope(data)
+        pw = await self.push_screen_wait(Ask(f"passphrase for {os.path.basename(path)}", password=True))
+        if not pw:
+            return
+        opened = idarchive.open_archive(data, pw)
+        await self._run_import(opened.entries, opened.rejected, f"{os.path.basename(path)}, made {opened.exported_at}")
+
+    async def _import_manual(self) -> None:
+        text = await self.push_screen_wait(Ask("paste a 64-hex seed, or the gateway's export_identity JSON", password=True))
+        if not text:
+            return
+        origin = name = ""
+        if not text.strip().startswith("{"):
+            origin = await self.push_screen_wait(Ask("the identity's origin (e.g. sys.knolastna.me)"))
+            if not origin:
+                return
+            name = await self.push_screen_wait(Ask(f"its username on {origin}"))
+            if not name:
+                return
+        entry = idarchive.parse_manual(text, origin, name)
+        await self._run_import([entry], [], "pasted identity")
+
+    async def _run_import(self, entries, rejected, source: str) -> None:
+        plans = core.plan_import(self.acct, entries)
+        lines = [f"[bold]{source}[/]", ""]
+        words = {"import": "[green]import[/]", "skip": "[dim]skip[/]", "conflict": "[yellow]conflict[/]", "corrupt": "[red]corrupt[/]"}
+        for p in plans:
+            lines.append(f"  {words[p.action]}  {p.entry.label}" + (f"  [dim]({p.reason})[/]" if p.reason else ""))
+        for what, why in rejected:
+            lines.append(f"  [red]unreadable[/]  {what}  [dim]({why})[/]")
+        conflicts = sum(p.action == "conflict" for p in plans)
+        todo = sum(p.action == "import" for p in plans)
+        if not todo and not conflicts:
+            await self.push_screen_wait(Show("\n".join(lines + ["", "nothing to import"])))
+            return
+        if not await self.push_screen_wait(YesNo("\n".join(lines + ["", f"import {todo} identit{'y' if todo == 1 else 'ies'}?"]))):
+            return
+        replace, backup_pw = False, None
+        if conflicts and await self.push_screen_wait(YesNo(
+            f"Replace {conflicts} identit{'y' if conflicts == 1 else 'ies'} you hold under the same name? "
+            "The ones replaced are backed up to an archive first."
+        )):
+            backup_pw = await self._new_passphrase("the backup of what's replaced")
+            replace = bool(backup_pw)
+
+        async def confirm(pending, url):
+            return await self.push_screen_wait(TrustKey(pending, url))
+
+        results = await core.import_identities(self.acct, plans, replace=replace, backup_passphrase=backup_pw, confirm_pin=confirm)
+        out = ["[bold]import finished[/]", ""]
+        colours = {"imported": "green", "replaced": "yellow", "skipped": "dim", "refused": "yellow", "rejected": "red"}
+        for r in results:
+            out.append(f"[{colours[r.outcome]}]{r.outcome}[/]  {r.entry.label}")
+            if r.backup:
+                out.append(f"    backed up the identity it replaced to {r.backup}")
+            out += [f"    [dim]{n}[/]" for n in r.notes]
+        await self.push_screen_wait(Show("\n".join(out)))
+        await self.load_boards()
 
     # -- loading -------------------------------------------------------------
 
