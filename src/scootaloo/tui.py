@@ -1,4 +1,4 @@
-"""The full-screen client: boards | threads | the open thread."""
+"""The full-screen client: log in, then boards (by origin) | threads | the open thread."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
     DataTable,
@@ -19,12 +19,14 @@ from textual.widgets import (
     Label,
     Markdown,
     OptionList,
+    Tree,
     Static,
     TextArea,
 )
 from textual.widgets.option_list import Option
 
 from scootaloo import core
+from scootaloo.accounts import Account, AccountError, Stores, Users, default_user
 
 
 def when(ts: int) -> str:
@@ -165,11 +167,117 @@ class Post(Vertical, can_focus=True):
         yield Static(head, classes="post-head")
         yield Static(meta, classes="post-meta")
         if self.item.body is None:
-            yield Static(Text(f"[body {v.body_state}]", style="dim italic"))
+            yield Static(Text(f"[body {self.item.note or v.body_state}]", style="dim italic"))
         elif "markdown" in (v.content_type or ""):
             yield Markdown(self.item.body)
         else:
             yield Static(Text(self.item.body))
+
+
+# ---------------------------------------------------------------------------
+# login
+# ---------------------------------------------------------------------------
+
+
+class Login(Screen[Account]):
+    """Pick a user and give their password, or make a new user. Every user has a password."""
+
+    BINDINGS = [Binding("ctrl+n", "toggle_new", "New user"), Binding("ctrl+q", "app.quit", "Quit")]
+
+    def __init__(self, user: str | None = None):
+        super().__init__()
+        self.preset = user
+        self.creating = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="login"):
+            yield Label(Text("scootaloo", style="bold"), id="login-title")
+            yield Label("", id="login-mode")
+            yield OptionList(id="login-users")
+            yield Input(placeholder="user name", id="login-name")
+            yield Input(placeholder="password", password=True, id="login-pw")
+            yield Input(placeholder="password again", password=True, id="login-pw2")
+            with Horizontal(id="compose-buttons"):
+                yield Button("Log in", variant="primary", id="login-go")
+                yield Button("New user (ctrl+n)", id="login-new")
+            yield Label("", id="login-error")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        with Users() as u:
+            names = u.names()
+        ol = self.query_one("#login-users", OptionList)
+        for n in names:
+            ol.add_option(Option(n, id=n))
+        self.creating = not names
+        guess = self.preset or default_user()
+        if guess in names:
+            ol.highlighted = names.index(guess)
+            self.query_one("#login-name", Input).value = guess
+        self._render_mode()
+
+    def _render_mode(self) -> None:
+        ol = self.query_one("#login-users", OptionList)
+        has_users = ol.option_count > 0
+        self.query_one("#login-mode", Label).update(
+            "Create a user. Their password also encrypts their Bonnet keys." if self.creating else "Log in"
+        )
+        ol.display = has_users and not self.creating
+        self.query_one("#login-pw2", Input).display = self.creating
+        self.query_one("#login-go", Button).label = "Create" if self.creating else "Log in"
+        self.query_one("#login-new", Button).label = "Back to log in" if self.creating else "New user (ctrl+n)"
+        self.query_one("#login-new", Button).display = has_users or not self.creating
+        name = self.query_one("#login-name", Input)
+        if self.creating:
+            name.value = ""
+            name.focus()
+        elif name.value:
+            self.query_one("#login-pw", Input).focus()
+        else:
+            name.focus()
+
+    @on(OptionList.OptionHighlighted, "#login-users")
+    def picked(self, ev: OptionList.OptionHighlighted) -> None:
+        self.query_one("#login-name", Input).value = ev.option.id
+
+    @on(OptionList.OptionSelected, "#login-users")
+    def chosen(self, ev: OptionList.OptionSelected) -> None:
+        self.query_one("#login-name", Input).value = ev.option.id
+        self.query_one("#login-pw", Input).focus()
+
+    @on(Button.Pressed, "#login-new")
+    def action_toggle_new(self) -> None:
+        self.creating = not self.creating
+        self._render_mode()
+
+    @on(Input.Submitted)
+    def submitted(self, ev: Input.Submitted) -> None:
+        if ev.input.id == "login-name":
+            self.query_one("#login-pw", Input).focus()
+        elif ev.input.id == "login-pw" and self.creating:
+            self.query_one("#login-pw2", Input).focus()
+        else:
+            self.go()
+
+    @on(Button.Pressed, "#login-go")
+    def go(self) -> None:
+        name = self.query_one("#login-name", Input).value.strip()
+        pw = self.query_one("#login-pw", Input).value
+        error = self.query_one("#login-error", Label)
+        try:
+            with Users() as u:
+                if self.creating:
+                    if pw != self.query_one("#login-pw2", Input).value:
+                        raise AccountError("passwords didn't match")
+                    u.add(name, pw)
+                acct = u.login(name, pw)
+        except AccountError as e:
+            error.update(Text(str(e), style="red"))
+            self.query_one("#login-pw", Input).value = ""
+            self.query_one("#login-pw2", Input).value = ""
+            self.query_one("#login-pw", Input).focus()
+            return
+        self.dismiss(acct)
 
 
 # ---------------------------------------------------------------------------
@@ -181,14 +289,14 @@ class ScootalooApp(App):
     TITLE = "scootaloo"
     CSS = """
     #panes { height: 1fr; }
-    #boards { width: 24; height: 1fr; border-right: solid $primary-darken-2; }
+    #boards { width: 30; height: 1fr; border-right: solid $primary-darken-2; }
     #threads { width: 1fr; height: 1fr; }
     #view { width: 1fr; border-left: solid $primary-darken-2; padding: 0 1; }
     #status { height: 1; background: $boost; color: $text-muted; padding: 0 1; }
-    .post-meta { color: $text-muted; height: auto; }
     .post { height: auto; margin: 0 0 1 0; padding: 0 1; border-left: tall $primary; }
     .post:focus { border-left: tall $accent; background: $boost; }
     .post-head { height: auto; }
+    .post-meta { color: $text-muted; height: auto; }
     .depth1 { margin-left: 2; } .depth2 { margin-left: 4; } .depth3 { margin-left: 6; }
     .depth4 { margin-left: 8; } .depth5 { margin-left: 10; } .depth6 { margin-left: 12; }
     #empty { color: $text-muted; padding: 1; }
@@ -201,6 +309,12 @@ class ScootalooApp(App):
     Ask, TrustKey { align: center middle; }
     .dialog { width: 80; height: auto; border: thick $primary; background: $surface; padding: 1 2; }
     #fingerprint { margin: 1 0; }
+    Login { align: center middle; }
+    #login { width: 60; height: auto; border: thick $primary; background: $surface; padding: 1 2; }
+    #login-title { margin-bottom: 1; }
+    #login-users { height: auto; max-height: 8; margin-bottom: 1; }
+    #login Input { margin-bottom: 1; }
+    #login-error { margin-top: 1; }
     """
     BINDINGS = [
         Binding("q", "quit", "Quit"),
@@ -208,14 +322,16 @@ class ScootalooApp(App):
         Binding("n", "new_thread", "New thread"),
         Binding("c", "reply", "Reply"),
         Binding("o", "connect", "Connect"),
-        Binding("u", "identity", "Identity"),
+        Binding("i", "identity", "Identity"),
+        Binding("ctrl+l", "switch_user", "Switch user"),
     ]
 
-    def __init__(self, origin: str | None = None, username: str | None = None, password: str | None = None):
+    def __init__(self, user: str | None = None, password: str | None = None,
+                 gateway_store: bool = False, relay: str | None = None):
         super().__init__()
-        self._want = (origin, username, password)
-        self.sess: core.Session | None = None
-        self.board: str | None = None
+        self._user, self._password, self._gateway, self._relay = user, password, gateway_store, relay
+        self.acct: Account | None = None
+        self.ref: core.BoardRef | None = None
         self.thread: core.Thread | None = None
 
     # -- layout ---------------------------------------------------------------
@@ -224,7 +340,7 @@ class ScootalooApp(App):
         yield Header()
         with Vertical():
             with Horizontal(id="panes"):
-                yield OptionList(id="boards")
+                yield Tree("relays", id="boards")
                 yield DataTable(id="threads", cursor_type="row", zebra_stripes=True)
                 with VerticalScroll(id="view"):
                     yield Static("pick a thread", id="empty")
@@ -232,93 +348,124 @@ class ScootalooApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        tree = self.query_one("#boards", Tree)
+        tree.show_root = False
         t = self.query_one("#threads", DataTable)
         t.add_column("#", key="num", width=5)
-        t.add_column("subject", key="subject", width=34)
+        t.add_column("subject", key="subject", width=28)
         t.add_column("author", key="author", width=14)
         t.add_column("date", key="when", width=5)
         self.start()
         self.set_interval(60, self._auto_refresh)
 
     def set_status(self) -> None:
-        if not self.sess:
-            msg = "not connected · press o"
-        else:
-            who = self.sess.username or "anonymous (read-only) · press u"
-            msg = f"{self.sess.origin} · {who}" + (f" · {self.board}" if self.board else "")
-        self.query_one("#status", Static).update(msg)
-        self.sub_title = self.sess.origin if self.sess else ""
+        if not self.acct:
+            self.query_one("#status", Static).update("not logged in")
+            return
+        parts = [self.acct.name]
+        if self.ref:
+            parts.append(self.ref.label + ("" if self.ref.is_home else f" via {self.ref.via}"))
+            try:
+                sess = core.writable(self.acct, self.ref)
+                parts.append(f"posting as {sess.username}")
+            except core.ScootalooError:
+                parts.append("read-only here")
+        elif not core.joined(self.acct):
+            parts.append("no relays yet · press o")
+        self.query_one("#status", Static).update(" · ".join(parts))
+        self.sub_title = self.acct.name
 
-    # -- startup / connecting ------------------------------------------------
+    # -- login, relays, identities -------------------------------------------
 
     @work
     async def start(self) -> None:
-        origin, username, password = self._want
-        try:
-            self.sess = core.Session.current(origin, username, password)
-        except core.ScootalooError:
-            self.sess = None
-        if self.sess is None:
-            self.set_status()
-            await self._connect_flow(core.DEFAULT_URL)
-            return
-        if self.sess.needs_password() and not self.sess.password:
-            pw = await self.push_screen_wait(Ask(f"password for {self.sess.username}", password=True))
-            if pw is None:
-                self.sess.username = None  # read anonymously instead
-                self.notify("reading anonymously", severity="warning")
-            self.sess.password = pw
+        acct = None
+        if self._gateway:
+            acct = Account(Stores.gateway(), "gateway store", self._password, gateway=True)
+        elif self._user and self._password:
+            try:
+                with Users() as u:
+                    acct = u.login(self._user, self._password)
+            except AccountError as e:
+                self.notify(str(e), severity="error")
+        if acct is None:
+            acct = await self.push_screen_wait(Login(self._user))
+        await self._enter(acct)
+
+    async def _enter(self, acct: Account) -> None:
+        self.acct, self.ref, self.thread = acct, None, None
+        self.query_one("#threads", DataTable).clear()
+        await self._clear_view("pick a thread")
+        if self._relay:
+            try:
+                core.set_active(acct, self._relay)
+            except core.ScootalooError as e:
+                self.notify(str(e), severity="warning")
         self.set_status()
-        await self.load_boards()
+        if not core.joined(acct):
+            await self._connect_flow(core.DEFAULT_URL)
+        else:
+            await self.load_boards()
+
+    @work
+    async def action_switch_user(self) -> None:
+        if isinstance(self.screen, Login):
+            return
+        if self._gateway:
+            self.notify("using the gateway store: there are no users to switch between", severity="warning")
+            return
+        acct = await self.push_screen_wait(Login())
+        await self._enter(acct)
+        self.notify(f"logged in as {acct.name}")
 
     async def _connect_flow(self, default_url: str) -> None:
-        url = await self.push_screen_wait(Ask("connect to (URL)", default_url))
+        url = await self.push_screen_wait(Ask("connect to a relay (URL)", default_url))
         if not url:
             return
         try:
             try:
-                r = await core.connect(url)
+                r = await core.connect(self.acct, url)
             except core.PinConfirmationRequired as p:
                 ok = await self.push_screen_wait(TrustKey(p, url))
                 if not ok:
-                    core.decline_pin(p)
+                    core.decline_pin(self.acct, p)
                     self.notify("key not trusted; nothing pinned", severity="warning")
                     return
-                core.accept_pin(p)
-                r = await core.connect(url)
+                core.accept_pin(self.acct, p)
+                r = await core.connect(self.acct, url)
         except Exception as e:  # noqa: BLE001 — show anything to the user
             self.notify(str(e), severity="error", timeout=8)
             return
-        self.sess = core.Session.current(r["origin"])
-        self.board, self.thread = None, None
-        self.set_status()
         self.notify(f"connected to {r['origin']}")
         await self.load_boards()
 
     @work
     async def action_connect(self) -> None:
-        await self._connect_flow(self.sess.url if self.sess else core.DEFAULT_URL)
+        if self.acct:
+            await self._connect_flow(core.DEFAULT_URL)
 
     @work
     async def action_identity(self) -> None:
-        if not self.sess:
+        """Pick or register the identity you post as on the relay you're looking at."""
+        if not self.acct:
             return
-        ids = [i["username"] for i in core.local_identities(self.sess.origin)]
-        hint = f" (have: {', '.join(ids)})" if ids else " (new name registers it)"
-        name = await self.push_screen_wait(Ask("act as" + hint, self.sess.username or ""))
+        relay = self.ref.via if self.ref else (core.active_relay(self.acct) or {}).get("origin")
+        if not relay:
+            self.notify("connect to a relay first (o)", severity="warning")
+            return
+        ids = [i["username"] for i in core.identities(self.acct, relay)]
+        current = core.Session.open(self.acct, relay).username or ""
+        hint = f"have: {', '.join(ids)}" if ids else "a new name registers it"
+        name = await self.push_screen_wait(Ask(f"post as, on {relay} ({hint})", current))
         if not name:
             return
         try:
             if name in ids:
-                core.use_identity(self.sess.origin, name)
-                self.sess = core.Session.current(self.sess.origin)
-                if self.sess.needs_password():
-                    self.sess.password = await self.push_screen_wait(Ask(f"password for {name}", password=True))
-                self.notify(f"acting as {name}")
+                core.use_identity(self.acct, relay, name)
+                self.notify(f"posting as {name} on {relay}")
             else:
-                r = await core.register(self.sess, name)
-                self.sess = core.Session.current(self.sess.origin)
-                self.notify(f"registered {r['username']}")
+                r = await core.register(core.Session.open(self.acct, relay), name)
+                self.notify(f"registered {r['username']} on {relay}")
         except Exception as e:  # noqa: BLE001
             self.notify(str(e), severity="error", timeout=8)
         self.set_status()
@@ -337,37 +484,66 @@ class ScootalooApp(App):
         return None
 
     async def load_boards(self) -> None:
-        if not self.sess:
+        if not self.acct:
             return
-        rows = await self._guard(core.boards(self.sess))
-        if rows is None:
+        refs = await self._guard(core.all_boards(self.acct))
+        if refs is None:
             return
-        ol = self.query_one("#boards", OptionList)
-        ol.clear_options()
-        for b in rows:
-            label = Text(b.name, style="dim" if b.closed else ("magenta" if b.name.startswith("~") else ""))
-            ol.add_option(Option(label, id=b.name))
-        ol.focus()
-        if rows and not self.board:
-            first = next((b.name for b in rows if b.name == "general"), rows[0].name)
-            ol.highlighted = [o.id for o in ol.options].index(first)
-            self.open_board(first)
+        tree = self.query_one("#boards", Tree)
+        tree.clear()
+        by_origin: dict[str, list[core.BoardRef]] = {}
+        for ref in refs:
+            by_origin.setdefault(ref.origin, []).append(ref)
+        first = None
+        for origin, rows in by_origin.items():
+            via = rows[0].via
+            label = Text(origin if via == origin else f"{origin}  via {via}")
+            label.stylize("bold", 0, len(origin))
+            label.stylize("dim", len(origin))
+            node = tree.root.add(label, expand=True)
+            for ref in rows:
+                style = "dim" if ref.closed else ("magenta" if ref.name.startswith("~") else "")
+                leaf = node.add_leaf(Text(ref.name, style=style), data=ref)
+                if first is None and ref.is_home and ref.name == "general":
+                    first = leaf
+                if first is None and ref.is_home and not ref.name.startswith("~"):
+                    first = leaf
+        tree.focus()
+        if self.ref:
+            keep = next((leaf for n in tree.root.children for leaf in n.children if leaf.data == self.ref), None)
+            first = keep or first
+        if first is not None:
+            tree.move_cursor(first)
+            if self.ref != first.data:
+                self.open_board(first.data)
 
-    @on(OptionList.OptionSelected, "#boards")
-    def board_selected(self, ev: OptionList.OptionSelected) -> None:
-        self.open_board(ev.option.id)
+    @on(Tree.NodeSelected, "#boards")
+    def board_selected(self, ev: Tree.NodeSelected) -> None:
+        if isinstance(ev.node.data, core.BoardRef):
+            self.open_board(ev.node.data)
 
     @work(exclusive=True, group="threads")
-    async def open_board(self, board: str) -> None:
-        self.board = board
+    async def open_board(self, ref: core.BoardRef) -> None:
+        if ref != self.ref:
+            self.thread = None
+            await self._clear_view("pick a thread")
+        self.ref = ref
         self.set_status()
-        rows = await self._guard(core.articles(self.sess, board, 100))
+        rows = await self._guard(core.articles(self.acct, ref, 100))
         t = self.query_one("#threads", DataTable)
         t.clear()
         for a in rows or []:
             subj = ("📌 " if a.pin_state == "pinned" else "") + (a.subject or "")
-            subj = subj if len(subj) <= 34 else subj[:33] + "…"
-            t.add_row(str(a.article_num), subj, core.author_label(a), datetime.fromtimestamp(a.created_at).strftime("%m-%d"), key=str(a.article_num))
+            subj = subj if len(subj) <= 28 else subj[:27] + "…"
+            t.add_row(
+                str(a.article_num), subj, core.author_label(a),
+                datetime.fromtimestamp(a.created_at).strftime("%m-%d"), key=str(a.article_num),
+            )
+
+    async def _clear_view(self, msg: str) -> None:
+        view = self.query_one("#view", VerticalScroll)
+        await view.remove_children()
+        await view.mount(Static(msg, id="empty"))
 
     @on(DataTable.RowSelected, "#threads")
     def thread_selected(self, ev: DataTable.RowSelected) -> None:
@@ -375,12 +551,12 @@ class ScootalooApp(App):
 
     @work(exclusive=True, group="view")
     async def open_thread(self, num: int, focus_num: int | None = None) -> None:
+        ref = self.ref
+        await self._clear_view("loading…")
+        th = await self._guard(core.thread(self.acct, ref, num))
         view = self.query_one("#view", VerticalScroll)
         await view.remove_children()
-        await view.mount(Static("loading…", id="empty"))
-        th = await self._guard(core.thread(self.sess, self.board, num))
-        await view.remove_children()
-        if th is None:
+        if th is None or ref != self.ref:
             return
         self.thread = th
         posts = [Post(item) for item in th.items]
@@ -395,48 +571,50 @@ class ScootalooApp(App):
             view.scroll_home(animate=False)
 
     def action_refresh(self) -> None:
-        if self.board:
-            self.open_board(self.board)
+        if not self.acct:
+            return
+        self.run_worker(self.load_boards())
+        if self.ref:
+            self.open_board(self.ref)
         if self.thread:
             self.open_thread(self.thread.root.article_num)
-        elif not self.board:
-            self.run_worker(self.load_boards())
 
     def _auto_refresh(self) -> None:
-        if self.board and not isinstance(self.screen, ModalScreen):
-            self.open_board(self.board)
+        if self.acct and self.ref and not isinstance(self.screen, (ModalScreen, Login)):
+            self.open_board(self.ref)
 
     # -- writing -------------------------------------------------------------
 
-    def _can_write(self) -> bool:
-        if not self.sess or not self.board:
-            return False
-        if not self.sess.username:
-            self.notify("you're anonymous: press u to pick or register an identity", severity="warning")
-            return False
-        if self.board.startswith("~"):
-            self.notify("bridge boards are crossposts; scootaloo doesn't do those yet", severity="warning")
-            return False
-        return True
+    def _writable(self) -> core.Session | None:
+        if not self.acct or not self.ref:
+            return None
+        try:
+            return core.writable(self.acct, self.ref)
+        except core.ScootalooError as e:
+            self.notify(str(e), severity="warning", timeout=8)
+            return None
 
     @work
     async def action_new_thread(self) -> None:
-        if not self._can_write():
+        sess = self._writable()
+        if not sess:
             return
-        res = await self.push_screen_wait(Compose(f"New thread on {self.board} as {self.sess.username}"))
+        res = await self.push_screen_wait(Compose(f"New thread on {self.ref.label} as {sess.username}"))
         if not res:
             return
-        r = await self._guard(core.post(self.sess, self.board, res[0], res[1]))
+        r = await self._guard(core.post(self.acct, self.ref, res[0], res[1]))
         if r:
             self.notify(f"posted #{r.article_num}")
-            self.open_board(self.board)
+            self.open_board(self.ref)
             self.open_thread(r.article_num)
 
     @work
     async def action_reply(self) -> None:
-        if not self._can_write() or not self.thread:
-            if self.sess and self.board and not self.thread:
-                self.notify("open a thread first", severity="warning")
+        if self.ref and not self.thread:
+            self.notify("open a thread first", severity="warning")
+            return
+        sess = self._writable()
+        if not sess or not self.thread:
             return
         focused = self.focused
         item = focused.item if isinstance(focused, Post) else self.thread.items[0]
@@ -444,11 +622,11 @@ class ScootalooApp(App):
         quote = "\n".join("> " + ln for ln in (item.body or "").splitlines()[:12])
         subj = v.subject if v.subject.lower().startswith("re:") else "Re: " + v.subject
         res = await self.push_screen_wait(
-            Compose(f"Reply to #{v.article_num} as {self.sess.username}", subj, quote + "\n\n" if quote else "")
+            Compose(f"Reply to #{v.article_num} as {sess.username}", subj, quote + "\n\n" if quote else "")
         )
         if not res:
             return
-        r = await self._guard(core.reply(self.sess, self.board, v.article_num, res[1], res[0]))
+        r = await self._guard(core.reply(self.acct, self.ref, v.article_num, res[1], res[0]))
         if r:
             self.notify(f"replied as #{r.article_num}")
             self.open_thread(self.thread.root.article_num, focus_num=r.article_num)

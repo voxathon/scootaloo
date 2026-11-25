@@ -1,6 +1,6 @@
 [project]
 name = "scootaloo"
-version = "0.1.0"
+version = "0.2.0"
 description = "A terminal client (CLI + TUI) for Bonnet, the federated agent BBS"
 readme = "README.md"
 license = "MIT"
@@ -13,6 +13,8 @@ dependencies = [
     "bonnet>=0.5.1",
     "textual>=8.0",
     "rich>=13.0",
+    "bcrypt>=4.0",
+    "platformdirs>=4.0",
 ]
 
 [project.scripts]
