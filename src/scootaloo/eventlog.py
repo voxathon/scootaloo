@@ -11,12 +11,21 @@ import struct
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from bonnet.core.record import ZERO_HASH, compute_event_hash, decode_record, encode_record
+from bonnet.core.record import (
+    ZERO_HASH,
+    compute_event_hash,
+    decode_record,
+    encode_record,
+    encode_unsigned_head,
+    verify_head_signature,
+)
 from bonnet.net.firehose_wire import (
     _read_blob32,
     _read_u16,
     _read_witness_set,
+    build_event_head,
     build_event_range,
+    parse_event_head_response_raw,
     parse_response,
 )
 
@@ -114,9 +123,10 @@ class Event:
     raw: bytes  # exactly as served
     rec: object  # decoded Record
     witnesses: list
-    chain: str = "unchecked"  # ok | break | gap | start | unchecked
+    chain: str = "unchecked"  # ok | break | gap | start | fork | unchecked
     canonical: bool = True  # re-encoding the decoded record gives back the served bytes
     sigs: dict = field(default_factory=dict)
+    alts: list = field(default_factory=list)  # other records served for this same seq: the origin forked
 
     @property
     def seq(self) -> int:
@@ -150,17 +160,93 @@ async def fetch(client, origin: str, start: int, count: int = BATCH) -> list[Eve
     return events
 
 
+@dataclass
+class HeadCheck:
+    """The origin's signed head, checked here: where the log ends, and the hash it ends on."""
+
+    seq: int
+    hash: bytes
+    sig: str  # valid | invalid | unverifiable (no key for that sequence: accept the origin's key)
+
+
+async def fetch_head(client, origin: str) -> HeadCheck:
+    """EVENT_HEAD, with its signature checked under the key that was the origin's at that sequence.
+
+    The pubkey inside the head is the head's own claim, so it isn't what we check against.
+    """
+    head = parse_event_head_response_raw(await client._send_command(build_event_head(origin)))
+    if head.origin != origin:
+        return HeadCheck(head.latest_origin_seq, head.latest_event_hash, "invalid")
+    key = client.origin_key_for_seq(origin, head.latest_origin_seq) if head.latest_origin_seq else None
+    if key is None:
+        sig = "unverifiable"
+    else:
+        sig = "valid" if verify_head_signature(key, encode_unsigned_head(head), head.origin_signature) else "invalid"
+    return HeadCheck(head.latest_origin_seq, head.latest_event_hash, sig)
+
+
+def merge(held: dict[int, Event], events: list[Event]) -> list[int]:
+    """Add fetched events to what's held. A different record for a seq we already hold is kept beside it,
+    never swapped in: two signed histories for one sequence is the thing a log reader most needs to see.
+
+    Returns the sequences that newly turned out to be forked.
+    """
+    forked = []
+    for e in events:
+        old = held.get(e.seq)
+        if old is None:
+            held[e.seq] = e
+        elif old.hash != e.hash and all(a.hash != e.hash for a in old.alts):
+            old.alts.append(e)
+            forked.append(e.seq)
+    return forked
+
+
 def check_chain(events: dict[int, Event]) -> None:
     """Mark every held event by whether its link to the one before checks out."""
+    lowest = min(events, default=0)
     for seq, e in events.items():
         if seq == 1:
             e.chain = "ok" if e.rec.previous_event_hash == ZERO_HASH else "break"
-            continue
-        prev = events.get(seq - 1)
-        if prev is None:
-            e.chain = "start"  # the one before isn't loaded yet
         else:
-            e.chain = "ok" if e.rec.previous_event_hash == prev.hash else "break"
+            prev = events.get(seq - 1)
+            if prev is None:
+                # nothing below loaded yet, or a hole between two loaded stretches
+                e.chain = "start" if seq == lowest else "gap"
+            else:
+                e.chain = "ok" if e.rec.previous_event_hash == prev.hash else "break"
+        if e.alts:
+            e.chain = "fork"
+
+
+def runs(events: dict[int, Event]) -> list[tuple[int, int]]:
+    """The contiguous stretches of held sequence numbers, newest first."""
+    out = []
+    for seq in sorted(events, reverse=True):
+        if out and out[-1][0] == seq + 1:
+            out[-1] = (seq, out[-1][1])
+        else:
+            out.append((seq, seq))
+    return out
+
+
+def anchor(events: dict[int, Event], head: HeadCheck | None) -> tuple[str, int]:
+    """Tie the held chain to the signed head: (state, lowest anchored seq).
+
+    ok: the record at the head's sequence hashes to the head's hash, and every link from there down to
+    the returned seq checks out, so that stretch is the history the origin signed (given a valid head sig).
+    mismatch: the record held at the head's sequence is not the one the head names.
+    unloaded: the head's record isn't held, so nothing is anchored.
+    """
+    if head is None or head.seq not in events:
+        return "unloaded", 0
+    top = events[head.seq]
+    if top.hash != head.hash:
+        return "mismatch", 0
+    lo = head.seq
+    while lo in events and events[lo].chain == "ok" and (lo - 1) in events:
+        lo -= 1
+    return "ok", lo
 
 
 # -- sentences ------------------------------------------------------------------
@@ -308,7 +394,8 @@ def _hit(t: Term, e: Event, names: dict, body: str | None) -> bool:
         return vs[0] in hay
     if t.key == "verify":
         bad = e.sigs.get("author") != "valid" or e.sigs.get("origin") == "invalid" or not e.canonical
-        return any((v == "fail") == bad for v in vs)
+        unverified = not bad and e.sigs.get("origin") != "valid"
+        return any(bad if v == "fail" else unverified if v == "unverified" else not bad for v in vs)
     if t.key == "chain":
         return any(e.chain == v for v in vs)
     return False

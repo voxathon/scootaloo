@@ -23,8 +23,9 @@ def post(servers):
 @pytest.mark.parametrize("action", ["pin", "close", "warn"])
 def test_ordinary_users_are_refused(post, action):
     mox, ref, num = post
-    with pytest.raises(core.ScootalooError, match="isn't a moderator"):
+    with pytest.raises(core.ScootalooError, match=r"refused .* for .*\(") as err:
         run(core.moderate(mox, ref, num, action, reason="spam"))
+    assert "press i" in str(err.value)
 
 
 def test_punishments_need_a_reason_and_posts_must_exist(post):
@@ -55,7 +56,7 @@ def test_tui_mod_menu_refusal(post):
             await settle(pilot, app)
             assert not isinstance(app.screen, ModMenu)
             msgs = [n.message for n in app._notifications]
-            assert any("isn't a moderator" in m for m in msgs), msgs
+            assert any("refused pin" in m for m in msgs), msgs
 
     asyncio.run(go())
 

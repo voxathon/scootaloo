@@ -989,6 +989,7 @@ class ScootalooApp(App):
         self.logs: dict[tuple[str, str], dict[int, object]] = {}  # (relay, origin) -> seq -> Event
         self.log_at: tuple[str, str] | None = None
         self.log_head = 0
+        self.log_heads: dict[tuple[str, str], object] = {}  # (relay, origin) -> eventlog.HeadCheck
         self.log_terms: list = []
         self.log_follow = False
         self.log_keys: dict[str, int] = {}
@@ -1081,7 +1082,7 @@ class ScootalooApp(App):
         self.index = core.Index()
         self.thread_cache = {}
         self.report_cache = {}  # never carry one user's moderation view over to the next
-        self.logs, self.log_at, self.log_follow = {}, None, False
+        self.logs, self.log_at, self.log_follow, self.log_heads = {}, None, False, {}
         self.previewing = None
         self._load_layout()
         self.query_one("#threads", DataTable).clear()
@@ -2061,18 +2062,31 @@ class ScootalooApp(App):
                 pass
             evs = await eventlog.fetch(c, origin, start, count)
         held = self.logs.setdefault(self.log_at, {})
-        for e in evs:
-            held[e.seq] = e
+        forked = eventlog.merge(held, evs)
         eventlog.check_chain(held)
+        if forked:
+            self.notify(f"conflicting records served for {origin} #{', #'.join(map(str, forked))}: a fork, or a relay lying (see the signatures)",
+                        severity="error", timeout=15)
         return len(evs)
+
+    async def _log_read_head(self) -> int:
+        """Fetch and check the origin's signed head; remember it for anchoring the chain."""
+        relay, origin = self.log_at
+        async with core.Session.open(self.acct, relay).reader() as c:
+            try:
+                await c.refresh_epoch_cache(origin)
+            except Exception:  # noqa: BLE001 — then the head signature reads "unverifiable"
+                pass
+            head = await eventlog.fetch_head(c, origin)
+        self.log_heads[self.log_at] = head
+        return head.seq
 
     async def _log_load_newest(self) -> None:
         relay, origin = self.log_at
         status = self.query_one("#log-status", Static)
         status.update(f"loading {origin}'s log…")
         try:
-            async with core.Session.open(self.acct, relay).reader() as c:
-                self.log_head = (await c.get_head(origin)).latest_origin_seq
+            self.log_head = await self._log_read_head()
             held = self.logs.get(self.log_at, {})
             if self.log_head and self.log_head not in held:
                 await self._log_fetch(max(1, self.log_head - eventlog.BATCH + 1))
@@ -2095,12 +2109,11 @@ class ScootalooApp(App):
             await self._log_fetch(max(1, low - eventlog.BATCH), min(eventlog.BATCH, low - 1))
 
     async def _log_newer(self) -> None:
-        relay, origin = self.log_at
-        async with core.Session.open(self.acct, relay).reader() as c:
-            head = (await c.get_head(origin)).latest_origin_seq
-        if head > self.log_head:
-            before = self.log_head
-            await self._log_fetch(before + 1, min(eventlog.BATCH, head - before))
+        before = self.log_head
+        head = await self._log_read_head()
+        if head > before:
+            # land on the new head's record so the anchor holds; a long burst leaves a gap behind it, shown as one
+            await self._log_fetch(max(before + 1, head - eventlog.BATCH + 1), min(eventlog.BATCH, head - before))
             self.log_head = head
             self._log_render()
 
@@ -2119,30 +2132,64 @@ class ScootalooApp(App):
         lt.clear()
         self.log_keys = {}
         rows = [e for _, e in sorted(held.items(), reverse=True) if eventlog.matches(self.log_terms, e, names)]
-        marks = {"ok": ("│", "green"), "break": ("✗", "bold red"), "gap": ("┆", "yellow"), "start": ("┊", "dim")}
+        marks = {"ok": ("│", "green"), "break": ("✗", "bold red"), "gap": ("┆", "yellow"), "start": ("┊", "dim"),
+                 "fork": ("⑂", "bold red")}
         for e in rows:
             bad = e.sigs.get("author") != "valid" or e.sigs.get("origin") == "invalid" or not e.canonical
             m, style = marks.get(e.chain, ("?", "dim"))
-            what = Text(eventlog.sentence(e.rec, names), style="bold red" if bad else "")
+            what = Text(eventlog.sentence(e.rec, names),
+                        style="bold red" if bad or e.alts else ("yellow" if e.sigs.get("origin") != "valid" else ""))
             lt.add_row(Text(m, style=style), str(e.seq), datetime.fromtimestamp(e.rec.created_at).strftime("%m-%d %H:%M"),
                        what, key=f"e{e.seq}")
             self.log_keys[f"e{e.seq}"] = e.seq
         if keep and f"e{keep}" in self.log_keys:
             lt.move_cursor(row=list(self.log_keys).index(f"e{keep}"), animate=False)
-        low, high = min(held, default=0), max(held, default=0)
-        broken = sorted(s for s, e in held.items() if e.chain == "break")
-        noncanon = sum(1 for e in held.values() if not e.canonical)
-        chain = (Text(f"chain BROKEN at #{', #'.join(map(str, broken))}", style="bold red") if broken
-                 else Text(f"chain ✓ #{low}–#{high}", style="green"))
-        hidden = len(held) - len(rows)
         st = Text(f"{self.log_at[1]} via {self.log_at[0]} · head #{self.log_head} · showing {len(rows)} of {len(held)} loaded"
-                  + (f" ({hidden} filtered out)" if hidden else "") + " · ")
-        st.append_text(chain)
+                  + (f" ({len(held) - len(rows)} filtered out)" if len(held) > len(rows) else "") + " · ")
+        st.append_text(self._log_chain_summary(held))
+        noncanon = sum(1 for e in held.values() if not e.canonical)
         if noncanon:
             st.append(f" · {noncanon} non-canonical!", style="bold red")
         if self.log_follow:
             st.append(" · following", style="cyan")
         self.query_one("#log-status", Static).update(st)
+
+    def _log_chain_summary(self, held: dict) -> Text:
+        """What the held chain actually proves, and no more: links, the signed head, forks, holes, keys."""
+        origin = self.log_at[1]
+        head = self.log_heads.get(self.log_at)
+        forks = sorted(s for s, e in held.items() if e.alts)
+        broken = sorted(s for s, e in held.items() if e.chain == "break")
+        if forks:
+            return Text(f"FORK at #{', #'.join(map(str, forks))}: conflicting records served for one sequence", style="bold red")
+        if broken:
+            return Text(f"chain BROKEN at #{', #'.join(map(str, broken))}", style="bold red")
+        state, lo = eventlog.anchor(held, head)
+        if state == "mismatch":
+            return Text(f"record #{head.seq} isn't the one {origin}'s signed head names", style="bold red")
+        if head is not None and head.sig == "invalid":
+            return Text(f"{origin}'s head has a BAD signature", style="bold red")
+        unverified = sum(1 for e in held.values() if e.sigs.get("origin") != "valid")
+        trusted = state == "ok" and head.sig == "valid" and not unverified
+        t = Text()
+        above = None
+        for a, b in eventlog.runs(held):
+            if above is not None:
+                hole = f"#{b + 1}" if b + 1 == above - 1 else f"#{b + 1}–#{above - 1}"
+                t.append(f" · {hole} not loaded · ", style="yellow")
+            above = a
+            if state == "ok" and b == head.seq:
+                t.append(f"chain ✓ #{max(a, lo)}–#{b} anchored to the signed head", style="green" if trusted else "yellow")
+                if a < lo:
+                    t.append(f" (#{a}–#{lo - 1} links don't reach it)", style="yellow")
+            else:
+                t.append(f"#{a}–#{b} links, not anchored", style="yellow")
+        unchecked = ([f"{unverified} record{'s' if unverified != 1 else ''}"] if unverified else []) + (
+            ["the head"] if head is not None and head.sig == "unverifiable" else [])
+        if unchecked:
+            t.append(f" · {' and '.join(unchecked)} unverified: no key for {origin} (connect to it to check)",
+                     style="bold yellow")
+        return t
 
     def _log_set_filter(self, text: str) -> bool:
         try:
@@ -2206,7 +2253,16 @@ class ScootalooApp(App):
         t.append(f"{e.sigs.get('origin', '?')}\n", style=ok(e.sigs.get("origin")))
         t.append(f"{'chain link':>14}  ", style="dim")
         t.append({"ok": "links to the previous record", "break": "DOES NOT link to the previous record",
-                  "start": "previous record not loaded yet"}.get(e.chain, e.chain) + "\n", style=ok(e.chain))
+                  "start": "previous record not loaded yet", "gap": "previous record not loaded (a gap in what's held)",
+                  "fork": "FORKED: more than one record was served for this sequence (signatures below)"}.get(e.chain, e.chain) + "\n",
+                 style=ok(e.chain) if e.chain != "gap" else "yellow")
+        t.append(f"{'event hash':>14}  ", style="dim")
+        head = self.log_heads.get(self.log_at)
+        t.append(e.hash.hex() + ("  (the signed head)" if head and head.seq == seq and head.hash == e.hash else "") + "\n")
+        for a in e.alts:
+            t.append(f"{'also served':>14}  ", style="bold red")
+            t.append(f"{a.hash.hex()} · {eventlog.sentence(a.rec, names)} · author sig {a.sigs.get('author', '?')}, "
+                     f"origin sig {a.sigs.get('origin', '?')}\n", style="red")
         t.append(f"{'encoding':>14}  ", style="dim")
         t.append("canonical\n" if e.canonical else "NOT canonical\n", style="green" if e.canonical else "bold red")
         t.append(f"{'witnesses':>14}  ", style="dim")

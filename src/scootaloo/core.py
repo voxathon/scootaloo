@@ -1301,7 +1301,10 @@ async def moderate(acct: Account, ref: BoardRef, num: int, action: str, reason: 
             return await c.publish_punishment_ban(key, reason, int(time.time()) + days * 86400, board=ref.name)
         except ProtocolError as e:
             if e.code == _DENIED:
-                raise ScootalooError(f"{ref.origin} refused: {sess.username} isn't a moderator for {ref.label}") from e
+                raise ScootalooError(
+                    f"{ref.origin} refused {action} for {sess.username} ({e.detail or 'denied'}). "
+                    f"If {sess.username} isn't the identity you meant, press i (or `scootaloo use NAME`)"
+                ) from e
             if e.code == 0x0009:
                 raise ScootalooError(f"nothing to do: {e.detail or e}") from e
             raise
@@ -1322,7 +1325,7 @@ async def lift_punishments(acct: Account, ref: BoardRef, num: int, reason: str =
                 await c.publish_punishment_revoke(bytes.fromhex(p.event_id), reason)
         except ProtocolError as e:
             if e.code == _DENIED:
-                raise ScootalooError(f"{ref.origin} refused: {sess.username} isn't a moderator there") from e
+                raise ScootalooError(f"{ref.origin} refused {sess.username} ({e.detail or 'denied'})") from e
             raise
         return len(mine)
 
@@ -1341,7 +1344,7 @@ async def board_state(acct: Account, ref: BoardRef, close: bool, reason: str = "
             return await c.publish_board_reopen(ref.name, reason)
         except ProtocolError as e:
             if e.code == _DENIED:
-                raise ScootalooError(f"{ref.origin} refused: {sess.username} can't close or reopen {ref.label}") from e
+                raise ScootalooError(f"{ref.origin} refused {sess.username} ({e.detail or 'denied'}): can't close or reopen {ref.label}") from e
             if e.code == 0x0009:
                 raise ScootalooError(f"{ref.label} is already {'closed' if close else 'open'}") from e
             raise

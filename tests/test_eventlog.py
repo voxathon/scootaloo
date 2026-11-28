@@ -65,6 +65,58 @@ def test_fetch_chain_sentences_layout(logworld):
     assert held[max(held)].chain == "break"
 
 
+def test_head_anchor_forks_gaps(logworld):
+    mox, ref, name, num = logworld
+
+    async def go():
+        async with core.Session.open(mox, "alpha.test").reader() as c:
+            await c.refresh_epoch_cache("alpha.test")
+            head = await ev.fetch_head(c, "alpha.test")
+            evs = await ev.fetch(c, "alpha.test", max(1, head.seq - 9), 10)
+            c.origin_key_for_seq = lambda origin, seq: None  # as if we'd never accepted the origin's key
+            blind = await ev.fetch_head(c, "alpha.test")
+            return head, evs, blind
+
+    head, evs, blind = run(go())
+    assert head.sig == "valid" and blind.sig == "unverifiable"
+    held = {}
+    assert ev.merge(held, evs) == []
+    ev.check_chain(held)
+    lo = min(held)
+    state, anchored = ev.anchor(held, head)
+    assert state == "ok" and anchored == lo and ev.runs(held) == [(lo, head.seq)]
+
+    # the head names a different record than the one held there
+    assert ev.anchor(held, ev.HeadCheck(head.seq, b"\x01" * 32, "valid"))[0] == "mismatch"
+    # the head's record isn't loaded: nothing is anchored
+    assert ev.anchor({s: e for s, e in held.items() if s != head.seq}, head) == ("unloaded", 0)
+
+    # a second, different record for a seq we hold is kept beside it, never swapped in
+    mid = head.seq - 2
+    orig = held[mid]
+    other = ev.Event(orig.raw[:-1] + bytes([orig.raw[-1] ^ 1]), orig.rec, [], sigs={"author": "valid", "origin": "invalid"})
+    assert ev.merge(held, [other]) == [mid] and ev.merge(held, [other]) == []  # reported once
+    assert held[mid] is orig and held[mid].alts == [other]
+    ev.check_chain(held)
+    assert held[mid].chain == "fork"
+    assert [e.seq for e in held.values() if ev.matches(ev.parse_query("chain:fork"), e, {})] == [mid]
+    orig.alts.clear()
+
+    # a hole between two loaded stretches is a gap, not a start
+    del held[mid]
+    ev.check_chain(held)
+    assert held[mid + 1].chain == "gap" and held[lo].chain in ("ok", "start")
+    assert ev.runs(held) == [(mid + 1, head.seq), (lo, mid - 1)]
+    assert ev.anchor(held, head) == ("ok", mid + 1)
+
+    # unverifiable origin signatures are their own filter, apart from failures
+    e = held[head.seq]
+    e.sigs = {**e.sigs, "origin": "unverifiable"}
+    unv = [x.seq for x in held.values() if ev.matches(ev.parse_query("verify:unverified"), x, {})]
+    assert unv == [head.seq]
+    assert not ev.matches(ev.parse_query("verify:fail"), e, {})
+
+
 def test_log_tab(logworld, monkeypatch):
     mox, ref, name, num = logworld
     copied = []
@@ -84,6 +136,8 @@ def test_log_tab(logworld, monkeypatch):
             status = str(app.query_one("#log-status", Static).render())
             assert lt.row_count >= 4 and "chain ✓" in status and "BROKEN" not in status
             assert f"#{app.log_head}" in status
+            assert "anchored to the signed head" in status and "unverified" not in status
+            assert app.log_heads[app.log_at].sig == "valid"
 
             # filter
             app.query_one("#log-filter", Input).value = "cat:boards"
@@ -139,7 +193,8 @@ def test_log_tab(logworld, monkeypatch):
             await wait_screen(pilot, app, Pick)
             await pilot.press("enter")
             await settle(pilot, app)
-            assert all("posted" in str(lt.get_row_at(i)[3]) or "replied" in str(lt.get_row_at(i)[3])
+            # (the relay is shared across test files: test_cli's edit is a post too)
+            assert all(any(w in str(lt.get_row_at(i)[3]) for w in ("posted", "replied", "edited"))
                        for i in range(lt.row_count))
 
             # follow: a new post appears without a refresh
